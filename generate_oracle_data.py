@@ -18,8 +18,19 @@ Author: SVScout Research Team
 import json
 import sys
 import gc
+
+# Force UTF-8 output for Windows console/redirection
+if sys.stdout.encoding != 'utf-8':
+    sys.stdout.reconfigure(encoding='utf-8')
+if sys.stderr.encoding != 'utf-8':
+    sys.stderr.reconfigure(encoding='utf-8')
 from pathlib import Path
 from typing import Optional
+import os
+
+# Set CUDA allocator config to avoid fragmentation (MUST be before torch import if possible, though torch is imported above)
+# Ideally this script should be run with the env var set externally, but we try here.
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import torch
 
@@ -27,16 +38,7 @@ import torch
 def check_cuda_availability() -> None:
     """Check if CUDA is available. Exit immediately if not."""
     if not torch.cuda.is_available():
-        print("=" * 60)
-        print("ERROR: CUDA is not available!")
-        print("=" * 60)
-        print("\nThis script requires an NVIDIA GPU with CUDA support.")
-        print("Please ensure you have:")
-        print("  1. An NVIDIA GPU installed")
-        print("  2. CUDA drivers installed")
-        print("  3. PyTorch with CUDA support (torch.cuda.is_available() == True)")
-        print(f"\nCurrent PyTorch version: {torch.__version__}")
-        print(f"CUDA available: {torch.cuda.is_available()}")
+        print(f"Error: CUDA is not available. Please install PyTorch with CUDA support.")
         sys.exit(1)
     
     # Print GPU info
@@ -83,7 +85,7 @@ def load_model_and_tokenizer():
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         quantization_config=quantization_config,
-        device_map="auto",
+        device_map="cuda:0",  # Force GPU usage, no shared memory
         attn_implementation="eager",  # REQUIRED for attention extraction
         trust_remote_code=True,
         torch_dtype=torch.float16
@@ -104,10 +106,10 @@ def load_narrativeqa_dataset():
     
     print("\nLoading NarrativeQA dataset (test split)...")
     
-    # Load the dataset
-    dataset = load_dataset("deepmind/narrativeqa", split="test")
+    # Load the dataset with streaming=True to avoid loading everything into RAM
+    dataset = load_dataset("deepmind/narrativeqa", split="test", streaming=True)
     
-    print(f"✓ Dataset loaded: {len(dataset)} samples")
+    print(f"✓ Dataset loaded (streaming mode)")
     
     return dataset
 
@@ -137,20 +139,10 @@ def extract_attention_scores(
     tokenizer,
     prompt: str,
     block_size: int = 512
-) -> tuple[list[float], list[int], int]:
+) -> tuple:
     """
-    Extract attention scores for the last token across all context blocks.
-    
-    Args:
-        model: The loaded LLM
-        tokenizer: The tokenizer
-        prompt: The formatted prompt string
-        block_size: Size of each block in tokens (default: 512)
-    
-    Returns:
-        all_block_scores: List of attention scores for each block
-        top_5_block_ids: IDs of the top 5 blocks
-        num_blocks: Total number of blocks
+    Extract attention scores from the input prompt.
+    Returns: (all_block_scores, top_5_block_ids, num_blocks)
     """
     # Tokenize the input
     inputs = tokenizer(
@@ -163,27 +155,39 @@ def extract_attention_scores(
     seq_length = inputs["input_ids"].shape[1]
     
     # Forward pass with attention output
+    # Use use_cache=False to save memory
     with torch.no_grad():
         outputs = model(
             **inputs,
             output_attentions=True,
-            return_dict=True
+            return_dict=True,
+            use_cache=False
         )
     
     # Get attention from the last layer
     # Shape: (batch_size, num_heads, seq_length, seq_length)
     last_layer_attention = outputs.attentions[-1]
     
-    # Get attention weights for the last token (the one that would generate the answer)
+    # Get attention weights for the last token
     # Shape: (batch_size, num_heads, seq_length)
-    last_token_attention = last_layer_attention[:, :, -1, :]
+    # Clone to detach from graph completely
+    last_token_attention = last_layer_attention[:, :, -1, :].clone()
     
     # Average across all heads
     # Shape: (batch_size, seq_length)
     avg_attention = last_token_attention.mean(dim=1)
     
-    # Move to CPU and convert to numpy
+    # Move to CPU and convert to numpy IMMEDIATELY to free GPU memory
     attention_scores = avg_attention[0].cpu().float().numpy()
+    
+    # AGGRESSIVE CLEANUP
+    del outputs
+    del last_layer_attention
+    del last_token_attention
+    del avg_attention
+    del inputs
+    torch.cuda.empty_cache()
+    gc.collect()
     
     # Calculate number of blocks
     num_blocks = (seq_length + block_size - 1) // block_size
@@ -207,7 +211,6 @@ def extract_attention_scores(
     top_5_block_ids = [idx for idx, _ in indexed_scores[:5]]
     
     # Clean up to prevent OOM
-    del outputs, last_layer_attention, last_token_attention, avg_attention
     torch.cuda.empty_cache()
     
     return all_block_scores, top_5_block_ids, num_blocks
@@ -236,8 +239,6 @@ def process_sample(
     except (KeyError, TypeError) as e:
         print(f"  Warning: Could not extract fields: {e}")
         return None
-    
-    # Check document length
     context_tokens = tokenizer.encode(context, add_special_tokens=False)
     
     if len(context_tokens) < min_tokens:
@@ -257,6 +258,8 @@ def process_sample(
             model, tokenizer, prompt, block_size
         )
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         print(f"  Warning: Attention extraction failed: {e}")
         return None
     
@@ -273,6 +276,40 @@ def process_sample(
     return result
 
 
+
+# MEMORY OPTIMIZATION: Use forward hooks to discard unused attention
+# This is much safer and cleaner than monkey patching.
+
+def drop_attention_hook(module, inputs, outputs):
+    """
+    Forward hook to drop attention weights from the output of LlamaDecoderLayer.
+    This saves memory by not keeping attention matrices for intermediate layers.
+    """
+    # LlamaDecoderLayer output: (hidden_states, self_attn_weights, present_key_value)
+    if isinstance(outputs, tuple) and len(outputs) >= 2:
+        # Replace attention weights (index 1) with None
+        # We perform a shallow copy of the tuple with the replacement
+        new_output = (outputs[0], None) + outputs[2:]
+        return new_output
+    return outputs
+
+def apply_memory_patches(model):
+    """
+    Apply forward hooks to LlamaDecoderLayers 0 to N-1 to discard attention weights.
+    Only the last layer will keep its attention weights.
+    """
+    num_layers = len(model.model.layers)
+    print("\nApplying memory optimization hooks...")
+    
+    # Apply hook to all layers EXCEPT the last one
+    for i in range(num_layers - 1):
+        layer = model.model.layers[i]
+        layer.register_forward_hook(drop_attention_hook)
+
+    print(f"✓ Registered hooks on layers 0 to {num_layers - 2} to discard attention weights.")
+    print(f"  Only layer {num_layers - 1} will return attention matrix.")
+
+
 def main():
     """Main entry point."""
     print("=" * 60)
@@ -281,23 +318,29 @@ def main():
     
     # Configuration
     NUM_SAMPLES = 50
-    MIN_TOKENS = 4000
-    MAX_TOKENS = 8000
-    BLOCK_SIZE = 512
+    MIN_TOKENS = 1000  # Safe minimum for V2
+    MAX_TOKENS = 2048  # V2 Safe Zone for 16GB VRAM
+    BLOCK_SIZE = 128   # Reset to 128 as requested
     OUTPUT_FILE = Path("oracle_data.json")
     
-    print(f"\nConfiguration:")
+    print(f"\nConfiguration (V2 Safe Mode):")
     print(f"  - Target samples: {NUM_SAMPLES}")
     print(f"  - Min tokens: {MIN_TOKENS}")
     print(f"  - Max tokens: {MAX_TOKENS}")
     print(f"  - Block size: {BLOCK_SIZE}")
     print(f"  - Output file: {OUTPUT_FILE}")
     
+
     # Step 1: Check CUDA
     check_cuda_availability()
     
     # Step 2: Load model
     model, tokenizer = load_model_and_tokenizer()
+    
+    # -------------------------------------------------------------------------
+    # MEMORY OPTIMIZATION: Use forward hooks
+    # -------------------------------------------------------------------------
+    apply_memory_patches(model)
     
     # Step 3: Load dataset
     dataset = load_narrativeqa_dataset()
@@ -308,16 +351,24 @@ def main():
     samples_processed = 0
     samples_skipped = 0
     
+    # V2 Limit Enforcement
+    SAFE_MAX_TOKENS = MAX_TOKENS
+    print(f"  Note: Using safe max tokens: {SAFE_MAX_TOKENS}")
+    
     for i, sample in enumerate(dataset):
         if len(results) >= NUM_SAMPLES:
             break
-        
+            
         print(f"\n[{i+1}] Processing sample {i}...", end=" ")
+        
+        # Explicit garbage collection before each sample
+        torch.cuda.empty_cache()
+        gc.collect()
         
         result = process_sample(
             model, tokenizer, sample,
             min_tokens=MIN_TOKENS,
-            max_tokens=MAX_TOKENS,
+            max_tokens=SAFE_MAX_TOKENS,
             block_size=BLOCK_SIZE
         )
         
@@ -330,13 +381,7 @@ def main():
         samples_processed += 1
         
         print(f"OK ({result['context_tokens']} tokens, {result['num_blocks']} blocks)")
-        print(f"  Question: {result['question'][:80]}...")
         print(f"  Top 5 blocks: {result['top_5_block_ids']}")
-        
-        # Periodic garbage collection
-        if samples_processed % 10 == 0:
-            gc.collect()
-            torch.cuda.empty_cache()
     
     # Step 5: Save results
     print(f"\n" + "=" * 60)

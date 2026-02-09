@@ -94,3 +94,7 @@ oracle_data.json
 .Trashes
 ehthumbs.db
 Thumbs.db
+
+
+*.txt
+*.onnx
