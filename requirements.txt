@@ -1,0 +1,23 @@
+# Scout-KV Phase 1: Oracle Data Generation Dependencies
+# ======================================================
+
+# Core ML Framework
+torch>=2.1.0
+
+# Hugging Face Transformers (for Llama-3)
+transformers>=4.40.0
+
+# Model Loading & Distribution
+accelerate>=0.27.0
+
+# 4-bit Quantization (CRITICAL for 16GB VRAM)
+bitsandbytes>=0.42.0
+
+# Dataset Loading
+datasets>=2.16.0
+
+# Progress bars (optional but helpful)
+tqdm>=4.66.0
+
+# For better memory management
+psutil>=5.9.0
