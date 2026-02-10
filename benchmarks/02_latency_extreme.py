@@ -156,6 +156,7 @@ def run():
     # We use a small initialized model to avoid loading weights
     model = MapleNet(input_dim=768, hidden_dim=128)
     model.eval()
+    model.half() # Match synthetic index dtype
     
     scanner = MapleScanner(model, device=model_device)
     
