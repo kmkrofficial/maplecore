@@ -99,5 +99,6 @@ Thumbs.db
 *.onnx
 *.png
 
-# Benchmark suite (not tracked in git)
-benchmarks/
+# Benchmark artifacts (scripts are tracked)
+benchmarks/data/
+benchmarks/results/

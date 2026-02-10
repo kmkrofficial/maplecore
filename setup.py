@@ -34,6 +34,7 @@ setup(
     ],
     extras_require={
         "benchmarks": [
+            "datasets>=2.14.0",
             "transformers>=4.30.0",
             "scikit-learn>=1.3.0",
             "tqdm>=4.65.0",
