@@ -76,6 +76,7 @@ class MapleTrainer:
         self.hidden_dim = hidden_dim
         self.dropout = dropout
         self.device = torch.device(device)
+        self.history_ = {"epoch": [], "loss": [], "val_recall": []}
         
         logger.info(f"MapleTrainer initialized (device={device})")
     
@@ -210,6 +211,10 @@ class MapleTrainer:
                 f"Loss: {avg_loss:.4f} | "
                 f"Val Recall@5: {val_recall*100:.1f}%"
             )
+            
+            self.history_["epoch"].append(epoch + 1)
+            self.history_["loss"].append(avg_loss)
+            self.history_["val_recall"].append(val_recall)
         
         # Load best state
         if best_state is not None:

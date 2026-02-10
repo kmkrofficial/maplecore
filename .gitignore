@@ -102,3 +102,7 @@ Thumbs.db
 # Benchmark artifacts (scripts are tracked)
 benchmarks/data/
 benchmarks/results/
+
+# Generated data & trained models
+data/
+models/

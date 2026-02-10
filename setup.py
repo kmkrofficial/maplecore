@@ -42,6 +42,11 @@ setup(
             "seaborn>=0.12.0",
             "requests>=2.28.0",
         ],
+        "training": [
+            "bitsandbytes>=0.41.0",
+            "accelerate>=0.24.0",
+            "peft>=0.6.0",
+        ],
         "dev": [
             "pytest>=7.0.0",
             "black>=23.0.0",
