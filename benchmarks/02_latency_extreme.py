@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 # 10k, 100k, 1M, 5M, 10M
 SCALING_COUNTS = [10_000, 100_000, 1_000_000, 5_000_000, 10_000_000]
 EMBED_DIM = 384
-NUM_TRIALS = 5
+NUM_TRIALS = 3
 WARMUP = 2
 
 # We'll use a dummy model for the scanner since we're testing search logic speed,
@@ -174,6 +174,11 @@ def run():
             results["counts"].append(count)
             
             for strategy in strategies:
+                if strategy == "linear" and count > 50_000:
+                    print(f"  {strategy:<15} SKIPPED (slow)")
+                    results["strategies"][strategy].append(None)
+                    continue
+
                 latency = benchmark(scanner, index, strategy)
                 results["strategies"][strategy].append(latency)
                 print(f"  {strategy:<15} {latency:>8.2f} ms")
