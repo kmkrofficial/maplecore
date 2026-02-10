@@ -41,6 +41,7 @@ setup(
             "matplotlib>=3.7.0",
             "seaborn>=0.12.0",
             "requests>=2.28.0",
+            "rank_bm25>=0.2.2",
         ],
         "training": [
             "bitsandbytes>=0.41.0",
