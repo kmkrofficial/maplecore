@@ -99,3 +99,4 @@ Thumbs.db
 *.txt
 *.onnx
 *.png
+benchmarks/
