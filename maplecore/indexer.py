@@ -1,6 +1,6 @@
 """
-Scout-KV Indexer
-================
+MAPLE Indexer
+=============
 Handles document chunking, BGE embedding, and index I/O.
 """
 
@@ -17,7 +17,7 @@ import torch
 logger = logging.getLogger(__name__)
 
 # BGE query instruction prefix
-QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
+_QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
 
 
 @dataclass
@@ -50,7 +50,7 @@ class Index:
         return 0
 
 
-class Indexer:
+class MapleIndexer:
     """
     Document indexer using BGE embeddings.
     
@@ -76,7 +76,7 @@ class Indexer:
         self.batch_size = batch_size
         self._model = None
         
-        logger.info(f"Indexer initialized (device={device})")
+        logger.info(f"MapleIndexer initialized (device={device})")
     
     @property
     def model(self):
@@ -151,7 +151,7 @@ class Indexer:
         Returns:
             Query embedding tensor [384]
         """
-        prefixed = QUERY_PREFIX + query
+        prefixed = _QUERY_PREFIX + query
         embedding = self.model.encode(
             prefixed,
             convert_to_tensor=True,

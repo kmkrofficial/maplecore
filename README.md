@@ -1,6 +1,6 @@
-# Scout-KV 🔭
+# MAPLE 🍁
 
-**Speculative Paging for Infinite Context LLMs**
+**Memory-Aware Predictive Loading Engine for Infinite Context LLMs**
 
 > Handle million-token documents on consumer hardware using learned attention patterns.
 
@@ -11,26 +11,26 @@
 
 ## 🎯 The Problem
 
-Modern LLMs have limited context windows (4K-128K tokens). Current solutions have critical flaws:
+Modern LLMs have limited context windows (4K–128K tokens). Current solutions have critical flaws:
 
 | Approach | Problem |
-|----------|---------|
+|-------------|-------------|
 | **Cloud APIs** | $$$, latency, privacy concerns |
-| **Standard RAG** | Only **30% Recall** - misses relevant context |
+| **Standard RAG** | Only **30% Recall** — misses relevant context |
 | **Naive Chunking** | Destroys semantic boundaries |
 
-## 🚀 The Solution: Scout-KV
+## 🚀 The Solution: MAPLE
 
-Scout-KV learns which context blocks actually matter by analyzing LLM attention patterns:
+MAPLE learns which context blocks *actually matter* by analyzing LLM attention patterns — a technique we call **Memory-Aware Predictive Loading**:
 
 ```
-Document (1M tokens) → Scout (1ms) → Top-5 Blocks → LLM (50ms) → Answer
+Document (1M tokens) → MAPLE (1ms) → Top-5 Blocks → LLM (50ms) → Answer
 ```
 
 ### Key Results
 
-| Metric | RAG | Scout-KV | Improvement |
-|--------|-----|----------|-------------|
+| Metric | RAG | MAPLE | Improvement |
+|--------|-----|-------|-------------|
 | **Recall@5** | 29.6% | **71.6%** | 2.4x better |
 | **Latency** | 0.85ms | 2.71ms | Acceptable |
 | **Model Size** | N/A | 100 KB | Tiny |
@@ -40,22 +40,28 @@ Document (1M tokens) → Scout (1ms) → Top-5 Blocks → LLM (50ms) → Answer
 We discovered that LLM attention is **extremely sparse**:
 - Only **3%** of context blocks receive meaningful attention
 - The rest can be safely pruned without affecting answer quality
-- Scout learns to predict which blocks will be attended to
+- MAPLE learns to predict which blocks will be attended to
 
 ---
 
 ## 📦 Installation
 
 ```bash
-pip install scoutkv
+pip install maplecore
 ```
 
 Or from source:
 
 ```bash
-git clone https://github.com/your-org/scout-kv.git
-cd scout-kv
+git clone https://github.com/kmkrworks/maple.git
+cd maple
 pip install -e .
+```
+
+To include benchmark dependencies:
+
+```bash
+pip install -e ".[benchmarks]"
 ```
 
 ---
@@ -63,10 +69,10 @@ pip install -e .
 ## ⚡ Quick Start
 
 ```python
-from scoutkv import ScoutKV
+from maplecore import Maple
 
 # Initialize client
-client = ScoutKV(model_path="scout_bge.pth")
+client = Maple(model_path="maple.pth")
 
 # Index a document
 client.index_file("books/sherlock_holmes.txt")
@@ -97,8 +103,9 @@ results = client.query("Describe Watson", strategy="linear")
 ## 🏗️ Architecture
 
 ```
-scoutkv/
-├── core.py       # ScoutBGE model (768 → 128 → 1)
+maplecore/
+├── core.py       # MapleNet model (768 → 128 → 1)
+├── client.py     # Maple client (high-level API)
 ├── indexer.py    # BGE embedding, chunking, I/O
 ├── search.py     # Linear, Hierarchical, Adaptive search
 ├── trainer.py    # Training logic
@@ -109,17 +116,17 @@ scoutkv/
 
 | Component | Description |
 |-----------|-------------|
-| **Indexer** | Chunks documents and generates BGE embeddings |
-| **ScoutBGE** | Lightweight MLP that scores block relevance |
-| **Scanner** | Implements search strategies |
-| **ScoutKV** | High-level client API |
+| **MapleIndexer** | Chunks documents and generates BGE embeddings |
+| **MapleNet** | Lightweight MLP that scores block relevance |
+| **MapleScanner** | Implements search strategies (Linear, Hierarchical, Adaptive) |
+| **Maple** | High-level client API |
 
 ---
 
-## 🧪 Training Your Own Scout
+## 🧪 Training Your Own MAPLE
 
 ```python
-from scoutkv import ScoutTrainer, Indexer
+from maplecore import MapleTrainer, MapleIndexer
 
 # Prepare training data with oracle labels
 training_data = [
@@ -128,11 +135,11 @@ training_data = [
 ]
 
 # Train
-trainer = ScoutTrainer(device="cuda")
+trainer = MapleTrainer(device="cuda")
 model, recall = trainer.train(
     training_data,
     epochs=20,
-    save_path="my_scout.pth"
+    save_path="maple.pth"
 )
 
 print(f"Best Recall@5: {recall*100:.1f}%")
@@ -141,6 +148,22 @@ print(f"Best Recall@5: {recall*100:.1f}%")
 ---
 
 ## 📊 Benchmarks
+
+Run the full benchmark suite:
+
+```bash
+pip install -e ".[benchmarks]"
+python -m benchmarks.run_all
+```
+
+### Available Benchmarks
+
+| Benchmark | Description |
+|-----------|-------------|
+| `01_recall_narrativeqa` | Full NarrativeQA recall: MAPLE vs RAG |
+| `02_latency_scaling` | Latency from 10K to 1M blocks |
+| `03_needle_in_haystack` | Precision at varying depths |
+| `04_cost_analysis` | Token cost savings vs full context |
 
 ### Scale Performance (Hierarchical Search)
 
@@ -162,10 +185,10 @@ print(f"Best Recall@5: {recall*100:.1f}%")
 ## 🔧 Configuration
 
 ```python
-from scoutkv import ScoutKV
+from maplecore import Maple
 
-client = ScoutKV(
-    model_path="scout_bge.pth",
+client = Maple(
+    model_path="maple.pth",
     device="cuda",           # or "cpu"
     chunk_size=500,          # characters per block
     strategy="adaptive"      # default search strategy
@@ -174,13 +197,13 @@ client = ScoutKV(
 
 ### Adaptive Search Parameters
 
-The Scanner class accepts tuning parameters:
+The MapleScanner class accepts tuning parameters:
 
 ```python
-from scoutkv import Scanner, ScoutBGE
+from maplecore import MapleScanner, MapleNet
 
-model = ScoutBGE.load("scout_bge.pth")
-scanner = Scanner(
+model = MapleNet.load("maple.pth")
+scanner = MapleScanner(
     model,
     confidence_threshold=0.15,  # Below this → RAG fallback
     mass_target=0.80,           # Accumulate until 80% attention mass
@@ -195,8 +218,8 @@ scanner = Scanner(
 
 See the `examples/` directory:
 
-- `demo_infinite_context.py` - Basic usage with Sherlock Holmes
-- `benchmark_vs_rag.py` - Compare Scout-KV vs standard RAG
+- `demo_infinite_context.py` — Basic usage with Sherlock Holmes
+- `benchmark_vs_rag.py` — Compare MAPLE vs standard RAG
 
 ---
 
@@ -212,7 +235,7 @@ See the `examples/` directory:
 
 ## 📄 License
 
-MIT License - see [LICENSE](LICENSE) for details.
+MIT License — see [LICENSE](LICENSE) for details.
 
 ---
 
@@ -224,4 +247,4 @@ MIT License - see [LICENSE](LICENSE) for details.
 
 ---
 
-**Built with ❤️ for the infinite context future.**
+**Built with 🍁 for the infinite context future.**

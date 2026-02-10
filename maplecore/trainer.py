@@ -1,7 +1,7 @@
 """
-Scout-KV Trainer
-================
-Logic for training the Scout model from oracle data.
+MAPLE Trainer
+==============
+Logic for training the MapleNet model from oracle data.
 """
 
 from __future__ import annotations
@@ -17,13 +17,13 @@ import torch.nn as nn
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
 
-from .core import ScoutBGE
+from .core import MapleNet
 
 logger = logging.getLogger(__name__)
 
 
-class ScoutDataset(Dataset):
-    """Dataset for Scout training."""
+class _MapleDataset(Dataset):
+    """Internal dataset for MAPLE training."""
     
     def __init__(self, data: List[Dict]) -> None:
         """
@@ -44,8 +44,8 @@ class ScoutDataset(Dataset):
         return combined, label, item["question"], item["block_id"]
 
 
-def collate_fn(batch):
-    """Custom collate function for DataLoader."""
+def _collate_fn(batch):
+    """Internal collate function for DataLoader."""
     embeddings = torch.stack([b[0] for b in batch])
     labels = torch.stack([b[1] for b in batch])
     questions = [b[2] for b in batch]
@@ -53,8 +53,8 @@ def collate_fn(batch):
     return embeddings, labels, questions, block_ids
 
 
-class ScoutTrainer:
-    """Trainer for Scout models."""
+class MapleTrainer:
+    """Trainer for MAPLE models."""
     
     def __init__(
         self,
@@ -77,11 +77,11 @@ class ScoutTrainer:
         self.dropout = dropout
         self.device = torch.device(device)
         
-        logger.info(f"ScoutTrainer initialized (device={device})")
+        logger.info(f"MapleTrainer initialized (device={device})")
     
     def compute_recall_at_k(
         self,
-        model: ScoutBGE,
+        model: MapleNet,
         val_loader: DataLoader,
         k: int = 5
     ) -> float:
@@ -89,7 +89,7 @@ class ScoutTrainer:
         Compute Recall@K on validation set.
         
         Args:
-            model: ScoutBGE model
+            model: MapleNet model
             val_loader: Validation DataLoader
             k: Number of top predictions to consider
             
@@ -129,9 +129,9 @@ class ScoutTrainer:
         lr: float = 1e-4,
         val_split: float = 0.2,
         save_path: Optional[Union[str, Path]] = None
-    ) -> Tuple[ScoutBGE, float]:
+    ) -> Tuple[MapleNet, float]:
         """
-        Train a Scout model.
+        Train a MAPLE model.
         
         Args:
             training_data: List of training examples
@@ -157,20 +157,20 @@ class ScoutTrainer:
         logger.info(f"Train: {len(train_data)} examples, Val: {len(val_data)} examples")
         
         train_loader = DataLoader(
-            ScoutDataset(train_data), 
+            _MapleDataset(train_data), 
             batch_size=batch_size,
             shuffle=True, 
-            collate_fn=collate_fn
+            collate_fn=_collate_fn
         )
         val_loader = DataLoader(
-            ScoutDataset(val_data), 
+            _MapleDataset(val_data), 
             batch_size=batch_size,
             shuffle=False, 
-            collate_fn=collate_fn
+            collate_fn=_collate_fn
         )
         
         # Initialize model
-        model = ScoutBGE(
+        model = MapleNet(
             input_dim=self.input_dim,
             hidden_dim=self.hidden_dim,
             dropout=self.dropout

@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-Demo: Infinite Context with Scout-KV
-====================================
+Demo: Infinite Context with MAPLE
+===================================
 
-This example demonstrates how Scout-KV handles a book-length document
-and performs precise retrieval using learned attention patterns.
+This example demonstrates how MAPLE handles a book-length document
+and performs precise retrieval using learned attention patterns
+(Memory-Aware Predictive Loading).
 """
 
 import logging
@@ -13,17 +14,17 @@ from pathlib import Path
 # Setup logging
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 
-from scoutkv import ScoutKV, setup_logging
+from maplecore import Maple
 
 
 def main():
     print("="*70)
-    print("Scout-KV: Infinite Context Demo")
+    print("MAPLE: Infinite Context Demo")
     print("="*70)
     
     # Initialize client
-    client = ScoutKV(
-        model_path="scout_bge.pth",
+    client = Maple(
+        model_path="maple.pth",
         device="cuda",
         strategy="adaptive"
     )
@@ -67,7 +68,7 @@ def main():
         print()
     
     print("="*70)
-    print("Done! Scout-KV successfully handled infinite context retrieval.")
+    print("Done! MAPLE successfully handled infinite context retrieval.")
     print("="*70)
 
 

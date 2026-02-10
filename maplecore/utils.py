@@ -1,6 +1,6 @@
 """
-Scout-KV Utilities
-==================
+MAPLE Utilities
+================
 Helper functions for device handling, logging, and common operations.
 """
 
@@ -18,7 +18,7 @@ def setup_logging(
     format_string: Optional[str] = None
 ) -> None:
     """
-    Configure logging for Scout-KV.
+    Configure logging for MAPLE.
     
     Args:
         level: Logging level (e.g., logging.INFO, logging.DEBUG)
@@ -49,7 +49,7 @@ def get_device(prefer_cuda: bool = True) -> torch.device:
     return torch.device("cpu")
 
 
-def ensure_utf8() -> None:
+def _ensure_utf8() -> None:
     """Ensure stdout/stderr use UTF-8 encoding."""
     if hasattr(sys.stdout, 'reconfigure'):
         if sys.stdout.encoding != 'utf-8':
@@ -58,7 +58,7 @@ def ensure_utf8() -> None:
             sys.stderr.reconfigure(encoding='utf-8')
 
 
-def compute_entropy(probs: torch.Tensor, eps: float = 1e-10) -> float:
+def _compute_entropy(probs: torch.Tensor, eps: float = 1e-10) -> float:
     """
     Compute entropy of a probability distribution.
     
@@ -74,7 +74,7 @@ def compute_entropy(probs: torch.Tensor, eps: float = 1e-10) -> float:
     return entropy.item()
 
 
-def cosine_similarity(
+def _cosine_similarity(
     query: torch.Tensor, 
     blocks: torch.Tensor
 ) -> torch.Tensor:

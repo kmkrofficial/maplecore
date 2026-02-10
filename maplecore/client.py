@@ -1,16 +1,7 @@
 """
-Scout-KV: Speculative Paging for Infinite Context LLMs
-=======================================================
-
-Scout-KV is a learned retrieval system that achieves 71% Recall@5
-compared to 30% for standard RAG, while maintaining sub-millisecond latency.
-
-Quick Start:
->>> from scoutkv import ScoutKV
->>> client = ScoutKV(model_path="scout_bge.pth")
->>> client.index_file("books/holmes.txt")
->>> results = client.query("Who is the killer?")
->>> print(results.blocks)
+MAPLE Client
+=============
+High-level client for Memory-Aware Predictive Loading Engine.
 """
 
 from __future__ import annotations
@@ -19,27 +10,23 @@ import logging
 from pathlib import Path
 from typing import List, Optional, Union
 
-from .core import ScoutBGE
-from .indexer import Block, Index, Indexer
-from .search import Scanner, SearchResult, SearchStrategy
-from .trainer import ScoutTrainer
-from .utils import get_device, setup_logging
+from .core import MapleNet
+from .indexer import Block, Index, MapleIndexer
+from .search import MapleScanner, SearchResult
+from .utils import get_device
 
-__version__ = "0.1.0"
-__author__ = "Scout-KV Team"
-
-# Default logger
 logger = logging.getLogger(__name__)
 
 
-class ScoutKV:
+class Maple:
     """
-    High-level Scout-KV client.
+    High-level MAPLE client.
     
-    Provides a simple interface for document indexing and search.
+    Provides a simple interface for document indexing and intelligent
+    context retrieval using Memory-Aware Predictive Loading.
     
     Example:
-        >>> client = ScoutKV(model_path="scout_bge.pth")
+        >>> client = Maple(model_path="maple.pth")
         >>> client.index_file("document.txt")
         >>> results = client.query("What is the main topic?")
         >>> for block_id in results.block_ids[:5]:
@@ -54,10 +41,10 @@ class ScoutKV:
         strategy: str = "adaptive"
     ) -> None:
         """
-        Initialize Scout-KV client.
+        Initialize MAPLE client.
         
         Args:
-            model_path: Path to Scout model weights (.pth)
+            model_path: Path to MAPLE model weights (.pth)
             device: Compute device ('cuda', 'cpu', or None for auto)
             chunk_size: Default chunk size for indexing
             strategy: Default search strategy ('linear', 'hierarchical', 'adaptive')
@@ -67,25 +54,25 @@ class ScoutKV:
         self.strategy = strategy
         
         # Initialize components
-        self.indexer = Indexer(device=self.device)
+        self.indexer = MapleIndexer(device=self.device)
         self._index: Optional[Index] = None
-        self._scanner: Optional[Scanner] = None
+        self._scanner: Optional[MapleScanner] = None
         
         # Load model if provided
         if model_path is not None:
             self.load_model(model_path)
         
-        logger.info(f"ScoutKV initialized (device={self.device}, strategy={strategy})")
+        logger.info(f"Maple initialized (device={self.device}, strategy={strategy})")
     
     def load_model(self, path: Union[str, Path]) -> None:
         """
-        Load a Scout model.
+        Load a MAPLE model.
         
         Args:
             path: Path to model weights
         """
-        model = ScoutBGE.load(path, device=self.device)
-        self._scanner = Scanner(model, device=self.device)
+        model = MapleNet.load(path, device=self.device)
+        self._scanner = MapleScanner(model, device=self.device)
         logger.info(f"Model loaded from {path}")
     
     def index_text(self, text: str, chunk_size: Optional[int] = None) -> Index:
@@ -216,19 +203,3 @@ class ScoutKV:
         if self._index is None:
             return 0
         return self._index.num_blocks
-
-
-# Expose main classes
-__all__ = [
-    "ScoutKV",
-    "ScoutBGE",
-    "Indexer",
-    "Index",
-    "Block",
-    "Scanner",
-    "SearchResult",
-    "SearchStrategy",
-    "ScoutTrainer",
-    "setup_logging",
-    "get_device",
-]

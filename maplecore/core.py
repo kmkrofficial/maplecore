@@ -1,7 +1,10 @@
 """
-Scout-KV Core Module
-====================
-Contains the ScoutBGE neural network model definition.
+MAPLE Core Module
+==================
+Contains the MapleNet neural network model definition.
+
+MapleNet is a lightweight MLP that scores block relevance by learning
+from LLM attention patterns (Memory-Aware Predictive Loading).
 """
 
 from __future__ import annotations
@@ -16,9 +19,9 @@ import torch.nn as nn
 logger = logging.getLogger(__name__)
 
 
-class ScoutBGE(nn.Module):
+class MapleNet(nn.Module):
     """
-    Scout model for BGE embeddings.
+    MAPLE relevance scoring network.
     
     Architecture: MLP (768 -> 128 -> 1)
     Input: Concatenated [query_embedding, block_embedding]
@@ -32,7 +35,7 @@ class ScoutBGE(nn.Module):
         dropout: float = 0.3
     ) -> None:
         """
-        Initialize ScoutBGE model.
+        Initialize MapleNet model.
         
         Args:
             input_dim: Input dimension (query + block embeddings)
@@ -49,7 +52,7 @@ class ScoutBGE(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.fc2 = nn.Linear(hidden_dim, 1)
         
-        logger.debug(f"ScoutBGE initialized: {input_dim} -> {hidden_dim} -> 1")
+        logger.debug(f"MapleNet initialized: {input_dim} -> {hidden_dim} -> 1")
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -85,7 +88,7 @@ class ScoutBGE(nn.Module):
         path: Union[str, Path], 
         device: str = "cuda",
         **kwargs
-    ) -> "ScoutBGE":
+    ) -> "MapleNet":
         """
         Load model weights from disk.
         
@@ -95,7 +98,7 @@ class ScoutBGE(nn.Module):
             **kwargs: Additional arguments for model initialization
             
         Returns:
-            Loaded ScoutBGE model
+            Loaded MapleNet model
         """
         model = cls(**kwargs)
         state_dict = torch.load(path, map_location=device, weights_only=True)

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Benchmark: Scout-KV vs Standard RAG
-===================================
+Benchmark: MAPLE vs Standard RAG
+==================================
 
-This example compares Scout-KV's learned retrieval against
+This example compares MAPLE's learned retrieval against
 standard RAG (cosine similarity) on the same dataset.
 """
 
@@ -17,13 +17,13 @@ import numpy as np
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 
-from scoutkv import ScoutKV, ScoutBGE, Indexer
-from scoutkv.utils import cosine_similarity
+from maplecore import Maple, MapleNet, MapleIndexer
+from maplecore.utils import _cosine_similarity as cosine_similarity
 
 
 def main():
     print("="*70)
-    print("Scout-KV vs RAG: Recall Benchmark")
+    print("MAPLE vs RAG: Recall Benchmark")
     print("="*70)
     
     # Load oracle data (ground truth)
@@ -36,8 +36,8 @@ def main():
     
     # Initialize components
     print("\n[2] Loading models...")
-    indexer = Indexer(device="cuda")
-    model = ScoutBGE.load("scout_bge.pth", device="cuda")
+    indexer = MapleIndexer(device="cuda")
+    model = MapleNet.load("maple.pth", device="cuda")
     
     # Load NarrativeQA
     from datasets import load_dataset
@@ -56,7 +56,7 @@ def main():
     MAX_TOKENS = 2048
     
     rag_recalls = []
-    scout_recalls = []
+    maple_recalls = []
     matched = 0
     
     for ds_sample in dataset:
@@ -96,16 +96,16 @@ def main():
         rag_recall = len(rag_pred & ground_truth) / 5
         rag_recalls.append(rag_recall)
         
-        # Scout: Learned MLP
+        # MAPLE: Learned MLP
         with torch.no_grad():
             query_exp = query_emb.unsqueeze(0).expand(len(blocks), -1)
             combined = torch.cat([query_exp, block_embs], dim=1)
             scores = torch.sigmoid(model(combined))
         
-        _, scout_top5 = torch.topk(scores, 5)
-        scout_pred = set(scout_top5.tolist())
-        scout_recall = len(scout_pred & ground_truth) / 5
-        scout_recalls.append(scout_recall)
+        _, maple_top5 = torch.topk(scores, 5)
+        maple_pred = set(maple_top5.tolist())
+        maple_recall = len(maple_pred & ground_truth) / 5
+        maple_recalls.append(maple_recall)
         
         matched += 1
         if matched % 10 == 0:
@@ -113,7 +113,7 @@ def main():
     
     # Results
     avg_rag = np.mean(rag_recalls) * 100
-    avg_scout = np.mean(scout_recalls) * 100
+    avg_maple = np.mean(maple_recalls) * 100
     
     print("\n" + "="*70)
     print("BENCHMARK RESULTS")
@@ -121,9 +121,9 @@ def main():
     print(f"{'Method':<20} | {'Recall@5':<15}")
     print("-"*40)
     print(f"{'RAG (Cosine Sim)':<20} | {avg_rag:.1f}%")
-    print(f"{'Scout-KV (MLP)':<20} | {avg_scout:.1f}%")
+    print(f"{'MAPLE (MLP)':<20} | {avg_maple:.1f}%")
     print("-"*40)
-    print(f"{'Improvement':<20} | {avg_scout/avg_rag:.1f}x")
+    print(f"{'Improvement':<20} | {avg_maple/avg_rag:.1f}x")
     print("="*70)
 
 

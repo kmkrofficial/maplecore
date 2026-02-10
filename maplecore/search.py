@@ -1,7 +1,8 @@
 """
-Scout-KV Search Engine
-======================
-Implements Linear, Hierarchical, and Adaptive search strategies.
+MAPLE Search Engine
+====================
+Implements Linear, Hierarchical, and Adaptive search strategies
+for Memory-Aware Predictive Loading.
 """
 
 from __future__ import annotations
@@ -14,9 +15,9 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from .core import ScoutBGE
+from .core import MapleNet
 from .indexer import Index
-from .utils import compute_entropy, cosine_similarity
+from .utils import _compute_entropy, _cosine_similarity
 
 logger = logging.getLogger(__name__)
 
@@ -42,9 +43,9 @@ class SearchResult:
         return len(self.block_ids)
 
 
-class Scanner:
+class MapleScanner:
     """
-    Scout-KV search engine.
+    MAPLE search engine.
     
     Supports multiple search strategies:
     - Linear: Score all blocks
@@ -54,7 +55,7 @@ class Scanner:
     
     def __init__(
         self,
-        model: ScoutBGE,
+        model: MapleNet,
         device: str = "cuda",
         confidence_threshold: float = 0.15,
         mass_target: float = 0.80,
@@ -65,7 +66,7 @@ class Scanner:
         Initialize the scanner.
         
         Args:
-            model: ScoutBGE model
+            model: MapleNet model
             device: Compute device
             confidence_threshold: Min confidence before fallback
             mass_target: Target attention mass for adaptive K
@@ -81,7 +82,7 @@ class Scanner:
         self.max_blocks = max_blocks
         self.chapter_size = chapter_size
         
-        logger.info(f"Scanner initialized (device={device})")
+        logger.info(f"MapleScanner initialized (device={device})")
     
     def _score_blocks(
         self, 
@@ -89,7 +90,7 @@ class Scanner:
         block_embs: torch.Tensor
     ) -> torch.Tensor:
         """
-        Score all blocks using Scout model.
+        Score all blocks using MAPLE model.
         
         Args:
             query_emb: Query embedding [dim]
@@ -239,12 +240,12 @@ class Scanner:
         probs = scores / scores.sum()
         
         # Calculate metrics
-        entropy = compute_entropy(probs)
+        entropy = _compute_entropy(probs)
         max_conf = scores.max().item()
         
         # Check: Low confidence -> fallback to cosine similarity
         if max_conf < self.confidence_threshold:
-            sims = cosine_similarity(query_emb, block_embs)
+            sims = _cosine_similarity(query_emb, block_embs)
             top_scores, top_ids = torch.topk(sims, min(k, len(sims)))
             
             latency = (time.perf_counter() - start) * 1000
