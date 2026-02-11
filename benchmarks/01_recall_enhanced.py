@@ -35,7 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from maplecore import MapleNet, MapleIndexer
 from maplecore.utils import _cosine_similarity as cosine_similarity
-from benchmarks.config import DATA_DIR, RESULTS_DIR, BGE_MODEL_NAME
+from benchmarks.config import DATA_DIR, RESULTS_DIR, BGE_MODEL_NAME, MODEL_PATH
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
 logger = logging.getLogger(__name__)
@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 K_VALUES = [1, 5, 10]
 CHUNK_SIZE = 500   # characters per block
-MODEL_PATH = Path("models/maple_v1.pth")
+
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 

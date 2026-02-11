@@ -22,7 +22,7 @@ RESULTS_DIR.mkdir(exist_ok=True)
 # Model & Device
 # ---------------------------------------------------------------------------
 DEFAULT_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-MODEL_PATH = Path("models/maple_v1.pth")
+MODEL_PATH = Path("models/maple_generalist.pth")
 
 # ---------------------------------------------------------------------------
 # Constants
