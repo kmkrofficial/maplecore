@@ -241,29 +241,34 @@ def main():
     # 2. Run Matrix
     logger.info(f"Starting Benchmark (Type: {args.type})")
     
-    for length in args.lengths:
-        for depth in DEPTHS:
-            logger.info(f"Testing Length={length:,}, Depth={depth}%...")
-            success = run_test(scanner, length, depth, args.type)
-            
-            results.append({
-                "length": length,
-                "depth": depth,
-                "success": success,
-                "type": args.type
-            })
-            
-            status = "PASSED" if success else "FAILED"
-            logger.info(f"  -> {status}")
+    from benchmarks.profiler import HardwareMonitor, wrap_result
+    
+    all_results = [] # Renamed to avoid conflict with `results` from `run_test`
+    
+    with HardwareMonitor(interval=0.1) as mon:
+        for length in args.lengths:
+            for depth in DEPTHS:
+                logger.info(f"Testing Length={length:,}, Depth={depth}%...")
+                success = run_test(scanner, length, depth, args.type)
+                
+                all_results.append({
+                    "length": length,
+                    "depth": depth,
+                    "success": success,
+                    "type": args.type
+                })
+                
+                status = "PASSED" if success else "FAILED"
+                logger.info(f"  -> {status}")
             
     # 3. Save Results
+    final_output = wrap_result(all_results, mon)
+    
     json_path = RESULTS_DIR / "needle_robustness.json"
-    with open(json_path, "w") as f:
-        json.dump(results, f, indent=2)
         
     # 4. Plot
     plot_path = RESULTS_DIR / "needle_heatmap.png"
-    plot_heatmap(results, plot_path)
+    plot_heatmap(all_results, plot_path) # Use all_results for plotting
 
 if __name__ == "__main__":
     main()

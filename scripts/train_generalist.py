@@ -219,4 +219,20 @@ def main():
         logger.info("Training curve saved.")
 
 if __name__ == "__main__":
-    main()
+    from benchmarks.profiler import HardwareMonitor, wrap_result
+    import json
+    
+    with HardwareMonitor(interval=0.1) as mon:
+        train()
+
+        
+    # Save metrics (Only hardware for now as main() returns nothing)
+    metrics = {"status": "completed"}
+    final_output = wrap_result(metrics, mon)
+    
+    out_path = Path("models/training_metrics.json")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(final_output, f, indent=2)
+        
+    print(f"Training profile saved to {out_path}")

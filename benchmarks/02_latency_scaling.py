@@ -102,47 +102,66 @@ def run():
     print("BENCHMARK 02: Latency Scaling")
     print("=" * 70)
 
-    # ---- Load components ----
-    indexer = MapleIndexer(device=DEFAULT_DEVICE)
-    model = MapleNet.load(MODEL_PATH, device=DEFAULT_DEVICE)
-    scanner = MapleScanner(model, device=DEFAULT_DEVICE)
+    device = DEFAULT_DEVICE
+    print(f"Running Latency Benchmark on {device}...")
+    
+    # Init Model (Outside loop to save time)
+    model = MapleNet.load(str(MODEL_PATH), device=device)
+    indexer = MapleIndexer(device=device)
+    scanner = MapleScanner(model, device=device)
+    
+    counts = SCALING_BLOCK_COUNTS # Use predefined scaling counts
+    metrics = []
+    
+    for n in counts:
+        print(f"--- Scale N={n} ---")
+        
+        with HardwareMonitor(interval=0.1) as mon:
+            # Create Index
+            index = _create_synthetic_index(indexer, n) # Use existing synthetic index creation
+            
+            # Prepare a query
+            query_emb = indexer.encode_query("What is the significance of the red herring?")
 
-    # Prepare a query
-    query_emb = indexer.encode_query("What is the significance of the red herring?")
-
-    strategies = ["linear", "hierarchical", "adaptive"]
-    results = {
-        "block_counts": [],
-        "strategies": {s: [] for s in strategies},
-    }
-
-    for target_blocks in SCALING_BLOCK_COUNTS:
-        print(f"\n--- {target_blocks:,} blocks ---")
-
-        index = _create_synthetic_index(indexer, target_blocks)
-        actual = index.num_blocks
-        results["block_counts"].append(actual)
-
-        for strategy in strategies:
-            latency = _benchmark_strategy(scanner, query_emb, index, strategy)
-            results["strategies"][strategy].append(latency)
-            print(f"  {strategy:<15} {latency:>8.2f} ms")
+            # Linear Search Profile
+            start = time.perf_counter()
+            for _ in range(NUM_TRIALS): # Use NUM_TRIALS for consistency
+                scanner.search(query_emb, index, k=5, strategy="linear")
+            lin_time = (time.perf_counter() - start) / NUM_TRIALS * 1000
+            
+            # Adaptive Search Profile
+            start = time.perf_counter()
+            for _ in range(NUM_TRIALS): # Use NUM_TRIALS for consistency
+                scanner.search(query_emb, index, k=5, strategy="adaptive")
+            adp_time = (time.perf_counter() - start) / NUM_TRIALS * 1000
+            
+        stats = mon.get_stats()
+        
+        metrics.append({
+            "n_blocks": n,
+            "linear_time_ms": lin_time,
+            "adaptive_time_ms": adp_time,
+            "speedup": lin_time / adp_time if adp_time > 0 else 0.0,
+            "hardware_usage": stats
+        })
 
         # Free memory
         del index
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    # ---- Save results ----
-    output_path = RESULTS_DIR / "latency_scaling.json"
-    with open(output_path, "w") as f:
-        json.dump(results, f, indent=2)
-
-    print("\n" + "=" * 70)
-    print(f"Saved -> {output_path}")
+    # Wrap Result
+    # Use empty monitor for global stats since we did per-scale
+    dummy_mon = HardwareMonitor() 
+    final_output = wrap_result(metrics, dummy_mon)
+    
+    out_file = RESULTS_DIR / "latency_results.json"
+    with open(out_file, "w", encoding="utf-8") as f:
+        json.dump(final_output, f, indent=2)
+    print(f"\nResults saved to {out_file}")
     print("=" * 70)
 
-    return results
+    return final_output
 
 
 if __name__ == "__main__":
