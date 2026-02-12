@@ -1,5 +1,5 @@
 # ======================
-# Scout-KV .gitignore
+# MAPLE .gitignore
 # ======================
 
 # Python
@@ -95,7 +95,15 @@ oracle_data.json
 ehthumbs.db
 Thumbs.db
 
-
 *.txt
 *.onnx
 *.png
+
+# Benchmark artifacts (scripts are tracked)
+benchmarks/data/
+benchmarks/results/
+
+# Generated data & trained models
+data/
+models/
+research_log.md
