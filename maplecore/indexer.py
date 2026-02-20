@@ -205,16 +205,17 @@ class MapleIndexer:
         Create an index from a file.
         
         Args:
-            path: Path to text file
+            path: Path to document file (.txt, .pdf, .docx, .html)
             chunk_size: Characters per block
-            encoding: File encoding
+            encoding: File encoding (ignored for rich documents)
             
         Returns:
             Index object
         """
+        from .parsers import extract_text_from_file
+        
         path = Path(path)
-        with open(path, "r", encoding=encoding) as f:
-            text = f.read()
+        text = extract_text_from_file(path)
         
         return self.create_index(text, chunk_size, str(path))
     

@@ -43,6 +43,11 @@ setup(
             "requests>=2.28.0",
             "rank_bm25>=0.2.2",
         ],
+        "parsers": [
+            "PyMuPDF>=1.23.0",
+            "python-docx>=1.1.0",
+            "beautifulsoup4>=4.12.0",
+        ],
         "training": [
             "bitsandbytes>=0.41.0",
             "accelerate>=0.24.0",
