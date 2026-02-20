@@ -11,10 +11,14 @@ Goal: Prevent catastrophic forgetting and overfitting to one structure.
 """
 
 import argparse
+import gc
 import json
 import logging
 import random
 import sys
+import uuid
+import requests
+from tqdm import tqdm
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -35,6 +39,138 @@ logger = logging.getLogger(__name__)
 NARRATIVE_DATA = DATA_DIR / "oracle_data.json"
 HOTPOT_DATA = DATA_DIR / "oracle_hotpotqa.json"
 MODEL_OUTPUT = "models/maple_generalist.pth"
+
+# Config for Needle
+FRANKENSTEIN_URL = "https://www.gutenberg.org/files/84/84-0.txt"
+CHUNK_SIZE = 200
+NUM_NEEDLE_SAMPLES = 1000
+
+def get_frankenstein_text() -> str:
+    """Download or load Frankenstein text."""
+    path = DATA_DIR / "frankenstein.txt"
+    if not path.exists():
+        logger.info("Downloading Frankenstein from Gutenberg...")
+        try:
+            resp = requests.get(FRANKENSTEIN_URL)
+            resp.raise_for_status()
+            text = resp.text
+            start = text.find("*** START OF THE PROJECT GUTENBERG EBOOK")
+            end = text.find("*** END OF THE PROJECT GUTENBERG EBOOK")
+            if start != -1 and end != -1:
+                text = text[start:end]
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+        except Exception as e:
+            logger.error(f"Failed to download: {e}")
+            return "Alice " * 10000 
+            
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+def generate_needle_data(indexer: MapleIndexer) -> list:
+    """Generate synthetic training data formatted for MapleTrainer."""
+    text = get_frankenstein_text()
+    blocks = indexer.chunk_text(text, chunk_size=CHUNK_SIZE)
+    logger.info("Encoding blocks for mining...")
+    blocks = blocks[:2000]
+    block_embs = indexer.encode_blocks(blocks, show_progress=True)
+    
+    dataset_items = []
+    
+    logger.info(f"Generating {NUM_NEEDLE_SAMPLES} synthetic samples...")
+    for _ in tqdm(range(NUM_NEEDLE_SAMPLES)):
+        secret = str(uuid.uuid4())
+        needle_text = f"The secret passkey is {secret}."
+        query = "What is the secret passkey?"
+        
+        query_emb = indexer.encode_query(query)
+        
+        target_idx = random.randint(0, len(blocks)-1)
+        base_block = blocks[target_idx]
+        
+        style = random.choice(["append", "prepend", "alone", "padded"])
+        if style == "append":
+            injected_text = base_block.text + f" {needle_text}"
+        elif style == "prepend":
+            injected_text = f"{needle_text} " + base_block.text
+        elif style == "padded":
+            injected_text = f"\n\n{needle_text}\n\n"
+        else:
+            injected_text = needle_text
+            
+        target_emb = indexer.model.encode(injected_text, convert_to_tensor=True)
+        
+        # Positive
+        dataset_items.append({
+            "question": query,
+            "query_emb": query_emb,
+            "block_emb": target_emb,
+            "label": 1.0,
+            "block_id": base_block.id if hasattr(base_block, "id") else -1,
+            "domain": "synthetic_needle"
+        })
+        
+        # Hard Negative 1 (wrong needle)
+        wrong_secret = str(uuid.uuid4())
+        wrong_text = base_block.text + f" The secret passkey is {wrong_secret}."
+        wrong_emb = indexer.model.encode(wrong_text, convert_to_tensor=True)
+        
+        dataset_items.append({
+            "question": query,
+            "query_emb": query_emb,
+            "block_emb": wrong_emb,
+            "label": 0.0,
+            "block_id": -1,
+            "domain": "synthetic_needle"
+        })
+        
+        # Hard Negative 2 (same block, no needle)
+        dataset_items.append({
+            "question": query,
+            "query_emb": query_emb,
+            "block_emb": block_embs[target_idx],
+            "label": 0.0,
+            "block_id": -1,
+            "domain": "synthetic_needle"
+        })
+        
+        # Hard Negative 3 (adjacent block prior)
+        if target_idx > 0:
+            dataset_items.append({
+                "question": query,
+                "query_emb": query_emb,
+                "block_emb": block_embs[target_idx - 1],
+                "label": 0.0,
+                "block_id": -1,
+                "domain": "synthetic_needle"
+            })
+            
+        # Hard Negative 4 (adjacent block after)
+        if target_idx < len(block_embs) - 1:
+            dataset_items.append({
+                "question": query,
+                "query_emb": query_emb,
+                "block_emb": block_embs[target_idx + 1],
+                "label": 0.0,
+                "block_id": -1,
+                "domain": "synthetic_needle"
+            })
+        
+        # Hard Negative 5 and 6 (random blocks)
+        for _ in range(2):
+            neg_idx = random.randint(0, len(blocks)-1)
+            if abs(neg_idx - target_idx) > 10:
+                dataset_items.append({
+                    "question": query,
+                    "query_emb": query_emb,
+                    "block_emb": block_embs[neg_idx],
+                    "label": 0.0,
+                    "block_id": -1,
+                    "domain": "synthetic_needle"
+                })
+                
+    return dataset_items
 
 def load_and_merge_data():
     """Load both datasets and merge them."""
@@ -150,7 +286,8 @@ def prepare_dataset(raw_samples, indexer: MapleIndexer) -> Dataset:
                 "query_emb": query_emb,
                 "block_emb": p_emb,
                 "label": 1.0,
-                "block_id": blocks[i]["id"] # Use normalized block ID
+                "block_id": blocks[i]["id"], # Use normalized block ID
+                "domain": sample.get("domain", "unknown")
             })
             # Negative
             dataset_items.append({
@@ -158,7 +295,8 @@ def prepare_dataset(raw_samples, indexer: MapleIndexer) -> Dataset:
                 "query_emb": query_emb,
                 "block_emb": n_emb,
                 "label": 0.0,
-                "block_id": -1 # Dummy ID for negative
+                "block_id": -1, # Dummy ID for negative
+                "domain": sample.get("domain", "unknown")
             })
             
     logger.info(f"Created {len(dataset_items)} training pairs.")
@@ -178,6 +316,23 @@ def main():
     
     # 3. Prepare Tensors
     train_data = prepare_dataset(raw_data, indexer)
+    
+    # Run garbage collection after preparing the first dataset
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
+    # Generate needle data
+    needle_data = generate_needle_data(indexer)
+    train_data.extend(needle_data)
+    
+    # Shuffle entire dataset
+    random.shuffle(train_data)
+    
+    # Run garbage collection before training
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     
     # 4. Train
     logger.info("Starting training...")
@@ -223,7 +378,7 @@ if __name__ == "__main__":
     import json
     
     with HardwareMonitor(interval=0.1) as mon:
-        train()
+        main()
 
         
     # Save metrics (Only hardware for now as main() returns nothing)
