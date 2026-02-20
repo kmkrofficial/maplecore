@@ -100,8 +100,15 @@ class MapleNet(nn.Module):
         Returns:
             Loaded MapleNet model
         """
-        model = cls(**kwargs)
         state_dict = torch.load(path, map_location=device, weights_only=True)
+        # Dynamically infer the input dimension from the saved state_dict
+        if "fc1.weight" in state_dict:
+            inferred_input_dim = state_dict["fc1.weight"].shape[1]
+            if "input_dim" not in kwargs or kwargs["input_dim"] != inferred_input_dim:
+                logger.info(f"Inferring input_dim={inferred_input_dim} from saved model weights.")
+                kwargs["input_dim"] = inferred_input_dim
+
+        model = cls(**kwargs)
         model.load_state_dict(state_dict)
         model.to(device)
         model.eval()

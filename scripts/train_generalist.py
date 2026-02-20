@@ -336,8 +336,9 @@ def main():
     
     # 4. Train
     logger.info("Starting training...")
+    input_dim = indexer.get_embedding_dimension() * 2
     trainer = MapleTrainer(
-        input_dim=indexer.model.get_sentence_embedding_dimension() * 2,
+        input_dim=input_dim,
         hidden_dim=128,
         device=args.device
     )

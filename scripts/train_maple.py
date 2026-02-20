@@ -242,8 +242,9 @@ def run(
 
     # ---- Train ----
     start = time.time()
+    input_dim = indexer.get_embedding_dimension() * 2
     trainer = MapleTrainer(
-        input_dim=768,     # 384 (query) + 384 (block)
+        input_dim=input_dim,     # query dim + block dim
         hidden_dim=128,
         dropout=0.3,
         device=device,
