@@ -266,24 +266,30 @@ def plot_grouped_bar(all_results: Dict, output_path: Path):
 # Main
 # ===================================================================
 
-def run(max_samples: int = 200):
+def run(
+    max_samples: int = 200, 
+    embedding_model: str = "BAAI/bge-small-en-v1.5",
+    model_path: Optional[Path] = None
+):
     """Run the enhanced multi-dataset recall benchmark."""
+    target_model_path = model_path if model_path else MODEL_PATH
     print("=" * 70)
     print("BENCHMARK 01 (ENHANCED): Multi-Dataset Recall")
     print(f"  Methods:  BM25, RAG, MAPLE")
+    print(f"  Encoder:  {embedding_model}")
     print(f"  Metrics:  Recall@{K_VALUES}")
     print(f"  Datasets: NarrativeQA, HotpotQA")
     print("=" * 70)
 
     # ---- Load components ----
-    indexer = MapleIndexer(device=DEVICE)
+    indexer = MapleIndexer(model_name=embedding_model, device=DEVICE)
 
     maple_model = None
-    if MODEL_PATH.exists():
-        maple_model = MapleNet.load(str(MODEL_PATH), device=DEVICE)
+    if target_model_path.exists():
+        maple_model = MapleNet.load(str(target_model_path), device=DEVICE)
         logger.info(f"Loaded MAPLE model: {maple_model.num_parameters:,} params")
     else:
-        logger.warning(f"No MAPLE model at {MODEL_PATH}, MAPLE will fallback to RAG")
+        logger.warning(f"No MAPLE model at {target_model_path}, MAPLE will fallback to RAG")
 
     # ---- Load datasets ----
     all_results = {}

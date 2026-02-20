@@ -134,8 +134,7 @@ def get_narrative_qa(split: str = "test"):
     logger.info(f"Loading NarrativeQA (split={split})")
     dataset = load_dataset(
         "deepmind/narrativeqa",
-        split=split,
-        trust_remote_code=True,
+        split=split
     )
     logger.info(f"NarrativeQA loaded: {len(dataset)} samples")
     return dataset
@@ -174,8 +173,7 @@ def get_hotpot_qa(
     dataset = load_dataset(
         "hotpot_qa",
         "distractor",
-        split=split,
-        trust_remote_code=True,
+        split=split
     )
 
     if max_samples is not None and max_samples < len(dataset):

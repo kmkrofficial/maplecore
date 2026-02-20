@@ -9,7 +9,7 @@ with open("README.md", "r", encoding="utf-8") as f:
 
 setup(
     name="maplecore",
-    version="0.1.0-alpha",
+    version="0.2.0-beta",
     author="Keerthi Raajan K M",
     description="Memory-Aware Predictive Loading Engine for Infinite Context LLMs",
     long_description=long_description,
@@ -17,7 +17,7 @@ setup(
     url="https://github.com/kmkrworks/maple",
     packages=find_packages(),
     classifiers=[
-        "Development Status :: 3 - Alpha",
+        "Development Status :: 4 - Beta",
         "Intended Audience :: Developers",
         "Intended Audience :: Science/Research",
         "License :: OSI Approved :: MIT License",
@@ -42,6 +42,8 @@ setup(
             "seaborn>=0.12.0",
             "requests>=2.28.0",
             "rank_bm25>=0.2.2",
+            "wandb>=0.15.0",
+            "google-generativeai>=0.4.0",
         ],
         "parsers": [
             "PyMuPDF>=1.23.0",
