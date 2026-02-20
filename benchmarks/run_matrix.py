@@ -15,6 +15,9 @@ import sys
 import logging
 import time
 from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Insert project root
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -52,7 +55,7 @@ def run_matrix():
         
         # Initialize W&B Run
         run = wandb.init(
-            project="maple-e2e-matrix",
+            project="maplecore",
             name=f"recall_{shortname}",
             config={
                 "embedding_model": embed_model,

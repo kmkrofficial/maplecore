@@ -14,6 +14,9 @@ import json
 import logging
 import time
 from typing import List, Dict
+from dotenv import load_dotenv
+
+load_dotenv()
 
 import torch
 import numpy as np
@@ -246,7 +249,7 @@ def main():
     
     run = None
     if wandb:
-        run = wandb.init(project="maple-e2e-matrix", name="e2e_generation")
+        run = wandb.init(project="maplecore", name="e2e_generation")
     
     eval_cache = retrieve_contexts(num_samples=50)
     if not eval_cache:

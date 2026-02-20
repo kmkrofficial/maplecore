@@ -28,6 +28,7 @@ wheels/
 venv/
 env/
 .venv/
+.env
 .env/
 ENV/
 

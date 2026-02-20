@@ -44,6 +44,7 @@ setup(
             "rank_bm25>=0.2.2",
             "wandb>=0.15.0",
             "google-generativeai>=0.4.0",
+            "python-dotenv>=1.0.0",
         ],
         "parsers": [
             "PyMuPDF>=1.23.0",
