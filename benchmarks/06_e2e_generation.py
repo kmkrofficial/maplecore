@@ -57,15 +57,17 @@ API_CONFIG = {
     "gemini-flash-lite-latest": {"max_workers": 10, "delay": 0} # 1000 RPM
 }
 
-def normalize_text(text: str) -> str:
+def normalize_text(text) -> str:
     """Normalize text for evaluation: lowercase, remove punctuation and articles."""
+    if not isinstance(text, str):
+        text = str(text)
     text = text.lower()
     text = text.translate(str.maketrans('', '', string.punctuation))
     tokens = text.split()
     tokens = [t for t in tokens if t not in {"a", "an", "the"}]
     return " ".join(tokens)
 
-def compute_rouge_score(prediction: str, references: List[str]) -> Dict[str, float]:
+def compute_rouge_score(prediction: str, ground_truth) -> Dict[str, float]:
     """Simple token-overlap Rogue-L estimation returning precision, recall, f1."""
     norm_pred = normalize_text(prediction)
     pred_tokens = set(norm_pred.split())
@@ -73,11 +75,14 @@ def compute_rouge_score(prediction: str, references: List[str]) -> Dict[str, flo
     if not pred_tokens:
         return {"precision": 0.0, "recall": 0.0, "f1_score": 0.0}
         
+    if not isinstance(ground_truth, list):
+        ground_truth = [ground_truth]
+        
     best_precision = 0.0
     best_recall = 0.0
     best_f1 = 0.0
     
-    for ref in references:
+    for ref in ground_truth:
         norm_ref = normalize_text(ref)
         ref_tokens = set(norm_ref.split())
         if not ref_tokens:
@@ -101,7 +106,7 @@ def compute_rouge_score(prediction: str, references: List[str]) -> Dict[str, flo
 def retrieve_contexts(num_samples: int = 50) -> List[Dict]:
     """Uses MAPLE to fetch Top-5 blocks for NarrativeQA questions."""
     logger.info(f"Loading {num_samples} NarrativeQA questions...")
-    ds = load_dataset("deepmind/narrativeqa", split="test")
+    ds = load_dataset("deepmind/narrativeqa", split="train")
     
     # We will use the Oracle data to avoid re-indexing full books in this script.
     oracle_path = "data/oracle_data.json"
@@ -173,12 +178,16 @@ def retrieve_contexts(num_samples: int = 50) -> List[Dict]:
     return eval_cache
 
 def _process_gemini_sample(item: Dict, model, delay: float) -> dict:
-    prompt = f"Context:\n{item['context']}\n\nQuestion: {item['question']}\nYou are a strict data extraction system. Answer using ONLY the exact words from the context. Do NOT write full sentences. Do NOT say 'The answer is...'. If the answer is 'John', output 'John'."
+    prompt = f"Context:\n{item['context']}\n\nQuestion: {item['question']}\nYou are a strict data extraction system. Answer using ONLY the exact words from the context. Do NOT write full sentences. Do NOT say 'The answer is...'. If the answer is 'John', output 'John'. 5. If the exact answer is completely missing from the context, output 'Not found'."
     
     start_time = time.time()
     try:
         response = model.generate_content(prompt)
-        prediction = response.text
+        try:
+            prediction = response.text
+        except ValueError:
+            # Safe fallback for empty parts where finish_reason is 1 (STOP)
+            prediction = ""
     except Exception as e:
         logger.warning(f"Gemini API error: {e}")
         time.sleep(5)
@@ -300,7 +309,7 @@ def evaluate_llama_local(eval_cache: List[Dict], run) -> dict:
         
     results = []
     for i, item in enumerate(eval_cache):
-        prompt = f"Context:\n{item['context']}\n\nQuestion: {item['question']}\nYou are a strict data extraction system. Answer using ONLY the exact words from the context. Do NOT write full sentences. Do NOT say 'The answer is...'. If the answer is 'John', output 'John'."
+        prompt = f"Context:\n{item['context']}\n\nQuestion: {item['question']}\nYou are a strict data extraction system. Answer using ONLY the exact words from the context. Do NOT write full sentences. Do NOT say 'The answer is...'. If the answer is 'John', output 'John'. 5. If the exact answer is completely missing from the context, output 'Not found'."
         # Truncate prompt safely
         prompt = prompt[:3500] 
         

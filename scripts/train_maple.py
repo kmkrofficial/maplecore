@@ -240,13 +240,14 @@ def run(
         logger.error("Not enough training data. Need at least 10 samples.")
         sys.exit(1)
 
+    # ---- Train ----
+    input_dim = indexer.get_embedding_dimension() * 2
+    
     # Free indexer GPU memory before training
     del indexer
     torch.cuda.empty_cache()
 
-    # ---- Train ----
     start = time.time()
-    input_dim = indexer.get_embedding_dimension() * 2
     trainer = MapleTrainer(
         input_dim=input_dim,     # query dim + block dim
         hidden_dim=128,
