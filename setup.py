@@ -48,6 +48,10 @@ setup(
             "python-docx>=1.1.0",
             "beautifulsoup4>=4.12.0",
         ],
+        "production": [
+            "onnx>=1.14.0",
+            "onnxruntime>=1.15.0",
+        ],
         "training": [
             "bitsandbytes>=0.41.0",
             "accelerate>=0.24.0",

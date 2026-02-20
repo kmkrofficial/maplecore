@@ -81,6 +81,41 @@ class MapleNet(nn.Module):
         path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(self.state_dict(), path)
         logger.info(f"Model saved to {path}")
+        
+    def export_to_onnx(
+        self, 
+        save_path: Union[str, Path], 
+        dummy_input_shape: tuple = (1, 768)
+    ) -> None:
+        """
+        Export the MAPLE model to ONNX format for production inference.
+        
+        Args:
+            save_path: Path to save the .onnx file
+            dummy_input_shape: Shape of the input tensor, defaults to [1, 768] 
+                               based on concatenated (query + block) embeddings
+        """
+        save_path = Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # We match dtype with model weight dtype
+        dummy_input = torch.randn(dummy_input_shape, device=next(self.parameters()).device, dtype=next(self.parameters()).dtype)
+        
+        torch.onnx.export(
+            self,
+            dummy_input,
+            save_path,
+            export_params=True,
+            opset_version=14,
+            do_constant_folding=True,
+            input_names=["input"],
+            output_names=["output"],
+            dynamic_axes={
+                "input": {0: "batch_size"},
+                "output": {0: "batch_size"}
+            }
+        )
+        logger.info(f"ONNX Model exported successfully to {save_path}")
     
     @classmethod
     def load(
