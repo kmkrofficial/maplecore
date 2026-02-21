@@ -98,32 +98,18 @@ def retrieve_contexts(num_samples: int = 50) -> List[Dict]:
         
     samples = oracle["samples"][:num_samples]
     
-    logger.info("Initializing MAPLE Pipeline...")
-    indexer = MapleIndexer(device=DEVICE)
-    if not MODEL_PATH.exists():
-        logger.error(f"MAPLE Net not found at {MODEL_PATH}")
-        return []
-        
-    maple_net = MapleNet.load(str(MODEL_PATH), device=DEVICE)
-    scanner = MapleScanner(maple_net, device=DEVICE)
-    
     eval_cache = []
     
     for i, s in enumerate(samples):
         question = s["question"]
         
-        # Build synthetic index
-        block_texts = list(s["all_block_texts"].values())
-        if len(block_texts) < 5:
-            continue
+        # Directly extract the 5 answer-bearing blocks from the oracle data
+        oracle_ids = s.get("top_5_block_ids", [])
+        if not oracle_ids:
+            oracle_ids = list(s["all_block_texts"].keys())[:5]
             
-        index = indexer.create_index("\n\n".join(block_texts))
-        
-        # Search
-        res = scanner.search(indexer.encode_query(question), index, strategy="adaptive")
-        
-        # Extract Top-5 blocks text
-        context_blocks = "\n---\n".join([index.blocks[idx].text for idx in res.block_ids[:5]])
+        block_text_dict = s["all_block_texts"]
+        context_blocks = "\n---\n".join([block_text_dict[str(idx)] for idx in oracle_ids if str(idx) in block_text_dict])
         
         # Match question to Native NarrativeQA for answers
         gt_answers = []
@@ -135,7 +121,7 @@ def retrieve_contexts(num_samples: int = 50) -> List[Dict]:
         if not gt_answers:
             # Fallback if somehow not found (unlikely)
             gt_answers = ["Unknown"]
-        
+            
         eval_cache.append({
             "question": question,
             "context": context_blocks,
@@ -145,15 +131,6 @@ def retrieve_contexts(num_samples: int = 50) -> List[Dict]:
         if (i+1) % 10 == 0:
             logger.info(f"  Retrieved {i+1}/{len(samples)}")
             
-    # CRITICAL VRAM PURGE
-    logger.info("Purging MAPLE from VRAM...")
-    del scanner
-    del maple_net
-    del indexer
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        
     return eval_cache
 
 def _process_gemini_sample(item: Dict, model, delay: float) -> dict:
