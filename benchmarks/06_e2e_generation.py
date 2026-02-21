@@ -157,7 +157,7 @@ def retrieve_contexts(num_samples: int = 50) -> List[Dict]:
     return eval_cache
 
 def _process_gemini_sample(item: Dict, model, delay: float) -> dict:
-    prompt = f"Context:\n{item['context']}\n\nQuestion: {item['question']}\nYou are a strict data extraction system. Answer using ONLY the exact words from the context. Do NOT write full sentences. Do NOT say 'The answer is...'. If the answer is 'John', output 'John'. 5. If the exact answer is completely missing from the context, output 'Not found'."
+    prompt = f"Context:\n{item['context']}\n\nQuestion: {item['question']}\nUsing the provided context, answer the question accurately and concisely. If the context does not contain the answer, output exactly 'Not found'."
     
     start_time = time.time()
     try:
@@ -287,7 +287,7 @@ def evaluate_llama_local(eval_cache: List[Dict], run) -> dict:
         
     results = []
     for i, item in enumerate(eval_cache):
-        prompt = f"Context:\n{item['context']}\n\nQuestion: {item['question']}\nYou are a strict data extraction system. Answer using ONLY the exact words from the context. Do NOT write full sentences. Do NOT say 'The answer is...'. If the answer is 'John', output 'John'. 5. If the exact answer is completely missing from the context, output 'Not found'."
+        prompt = f"Context:\n{item['context']}\n\nQuestion: {item['question']}\nUsing the provided context, answer the question accurately and concisely. If the context does not contain the answer, output exactly 'Not found'."
         # Truncate prompt safely
         prompt = prompt[:3500] 
         

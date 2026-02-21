@@ -84,7 +84,7 @@ class MapleIndexer:
         if self._model is None:
             from sentence_transformers import SentenceTransformer
             logger.info(f"Loading embedding model: {self.model_name}")
-            self._model = SentenceTransformer(self.model_name, device=self.device)
+            self._model = SentenceTransformer(self.model_name, device=self.device, trust_remote_code=True)
         return self._model
         
     def get_embedding_dimension(self) -> int:
