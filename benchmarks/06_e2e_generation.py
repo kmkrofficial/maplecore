@@ -57,51 +57,30 @@ API_CONFIG = {
     "gemini-flash-lite-latest": {"max_workers": 10, "delay": 0} # 1000 RPM
 }
 
-def normalize_text(text) -> str:
-    """Normalize text for evaluation: lowercase, remove punctuation and articles."""
-    if not isinstance(text, str):
-        text = str(text)
-    text = text.lower()
-    text = text.translate(str.maketrans('', '', string.punctuation))
-    tokens = text.split()
-    tokens = [t for t in tokens if t not in {"a", "an", "the"}]
-    return " ".join(tokens)
+def evaluate_with_llm_judge(judge_model, generated_answer: str, ground_truth_list: list) -> int:
+    """Uses a dedicated LLM to semantically judge the correctness of the answer."""
+    prompt = f"""You are an expert evaluator grading a question-answering system.
+Determine if the 'Generated Answer' is factually correct and semantically matches ANY of the acceptable 'Ground Truths'.
+Ignore minor differences in grammar, punctuation, or extra conversational filler.
 
-def compute_rouge_score(prediction: str, ground_truth) -> Dict[str, float]:
-    """Simple token-overlap Rogue-L estimation returning precision, recall, f1."""
-    norm_pred = normalize_text(prediction)
-    pred_tokens = set(norm_pred.split())
-    
-    if not pred_tokens:
-        return {"precision": 0.0, "recall": 0.0, "f1_score": 0.0}
-        
-    if not isinstance(ground_truth, list):
-        ground_truth = [ground_truth]
-        
-    best_precision = 0.0
-    best_recall = 0.0
-    best_f1 = 0.0
-    
-    for ref in ground_truth:
-        norm_ref = normalize_text(ref)
-        ref_tokens = set(norm_ref.split())
-        if not ref_tokens:
-            continue
-            
-        overlap = len(pred_tokens.intersection(ref_tokens))
-        precision = overlap / len(pred_tokens)
-        recall = overlap / len(ref_tokens)
-        
-        f1 = 0.0
-        if precision + recall > 0:
-            f1 = 2 * (precision * recall) / (precision + recall)
-            
-        if f1 > best_f1:
-            best_f1 = f1
-            best_precision = precision
-            best_recall = recall
-            
-    return {"precision": best_precision, "recall": best_recall, "f1_score": best_f1}
+Ground Truths: {ground_truth_list}
+Generated Answer: {generated_answer}
+
+Respond with EXACTLY and ONLY the word "YES" if the answer is correct, or "NO" if it is incorrect."""
+
+    try:
+        verdict = judge_model.generate_content(prompt)
+        try:
+            verdict_text = verdict.text.upper()
+            return 1 if "YES" in verdict_text else 0
+        except ValueError:
+            return 0
+    except Exception as e:
+        logger.warning(f"Judge API error: {e}")
+        time.sleep(2) # Backoff for the judge
+        return 0
+
+
 
 def retrieve_contexts(num_samples: int = 50) -> List[Dict]:
     """Uses MAPLE to fetch Top-5 blocks for NarrativeQA questions."""
@@ -198,15 +177,14 @@ def _process_gemini_sample(item: Dict, model, delay: float) -> dict:
     if delay > 0:
         time.sleep(delay)
         
-    scores = compute_rouge_score(prediction, item["ground_truths"])
+    baseline_judge = genai.GenerativeModel('gemini-flash-lite-latest')
+    score = evaluate_with_llm_judge(baseline_judge, prediction, item["ground_truths"])
     
     return {
         "question": item["question"],
         "prediction": prediction,
         "ground_truths": item["ground_truths"],
-        "precision": scores["precision"],
-        "recall": scores["recall"],
-        "f1_score": scores["f1_score"],
+        "accuracy": score,
         "latency_sec": latency
     }
 
@@ -231,27 +209,21 @@ def evaluate_gemini_model(eval_cache: List[Dict], model_name: str, run) -> dict:
     if not results:
         return {}
         
-    avg_precision = np.mean([r["precision"] for r in results]) * 100
-    avg_recall = np.mean([r["recall"] for r in results]) * 100
-    avg_f1 = np.mean([r["f1_score"] for r in results]) * 100
+    avg_accuracy = np.mean([r["accuracy"] for r in results]) * 100
     avg_latency = np.mean([r["latency_sec"] for r in results])
     
-    logger.info(f"  {model_name} - F1: {avg_f1:.1f}%, Prec: {avg_precision:.1f}%, Rec: {avg_recall:.1f}%, Latency: {avg_latency:.2f}s")
+    logger.info(f"  {model_name} - Accuracy: {avg_accuracy:.1f}%, Latency: {avg_latency:.2f}s")
     
     if run:
         wandb.log({
-            f"{model_name}/f1_score": avg_f1,
-            f"{model_name}/precision": avg_precision,
-            f"{model_name}/recall": avg_recall,
+            f"{model_name}/accuracy": avg_accuracy,
             f"{model_name}/latency_sec": avg_latency
         })
         
     return {
         "model": model_name,
         "metrics": {
-            "f1_score": avg_f1,
-            "precision": avg_precision,
-            "recall": avg_recall,
+            "accuracy": avg_accuracy,
             "latency_sec": avg_latency
         },
         "samples": results
@@ -278,7 +250,7 @@ def evaluate_all_gemini(eval_cache: List[Dict], run) -> List[dict]:
 def evaluate_llama_local(eval_cache: List[Dict], run) -> dict:
     logger.info(f"Evaluating {LOCAL_LLM} locally in 4-bit...")
     try:
-        from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+        from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, GenerationConfig
         import transformers
     except ImportError:
         logger.warning("Missing transformers/bitsandbytes. Skipping local Llama.")
@@ -297,11 +269,17 @@ def evaluate_llama_local(eval_cache: List[Dict], run) -> dict:
             device_map="auto"
         )
         
+        gen_config = GenerationConfig(
+            max_new_tokens=50,
+            do_sample=False,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+        
         pipeline = transformers.pipeline(
             "text-generation",
             model=model,
             tokenizer=tokenizer,
-            max_new_tokens=50
+            generation_config=gen_config,
         )
     except Exception as e:
         logger.warning(f"Failed to load local Llama (requires access/hardware): {e}")
@@ -315,40 +293,36 @@ def evaluate_llama_local(eval_cache: List[Dict], run) -> dict:
         
         start_time = time.time()
         try:
-            out = pipeline(prompt, do_sample=False, return_full_text=False)
+            out = pipeline(prompt, return_full_text=False)
             prediction = out[0]["generated_text"].strip()
         except Exception as e:
             logger.warning(f"Llama inference failed: {e}")
             prediction = ""
             
         latency = time.time() - start_time
-        scores = compute_rouge_score(prediction, item["ground_truths"])
+        
+        baseline_judge = genai.GenerativeModel('gemini-flash-lite-latest')
+        score = evaluate_with_llm_judge(baseline_judge, prediction, item["ground_truths"])
         
         results.append({
             "question": item["question"],
             "prediction": prediction,
             "ground_truths": item["ground_truths"],
-            "precision": scores["precision"],
-            "recall": scores["recall"],
-            "f1_score": scores["f1_score"],
+            "accuracy": score,
             "latency_sec": latency
         })
         
     if not results:
         return {}
         
-    avg_precision = np.mean([r["precision"] for r in results]) * 100
-    avg_recall = np.mean([r["recall"] for r in results]) * 100
-    avg_f1 = np.mean([r["f1_score"] for r in results]) * 100
+    avg_accuracy = np.mean([r["accuracy"] for r in results]) * 100
     avg_latency = np.mean([r["latency_sec"] for r in results])
     
-    logger.info(f"  {LOCAL_LLM} - F1: {avg_f1:.1f}%, Prec: {avg_precision:.1f}%, Rec: {avg_recall:.1f}%, Latency: {avg_latency:.2f}s")
+    logger.info(f"  {LOCAL_LLM} - Accuracy: {avg_accuracy:.1f}%, Latency: {avg_latency:.2f}s")
     
     if run:
         wandb.log({
-            f"llama3_8b/f1_score": avg_f1,
-            f"llama3_8b/precision": avg_precision,
-            f"llama3_8b/recall": avg_recall,
+            f"llama3_8b/accuracy": avg_accuracy,
             f"llama3_8b/latency_sec": avg_latency
         })
         
@@ -364,9 +338,7 @@ def evaluate_llama_local(eval_cache: List[Dict], run) -> dict:
     return {
         "model": LOCAL_LLM,
         "metrics": {
-            "f1_score": avg_f1,
-            "precision": avg_precision,
-            "recall": avg_recall,
+            "accuracy": avg_accuracy,
             "latency_sec": avg_latency
         },
         "samples": results
