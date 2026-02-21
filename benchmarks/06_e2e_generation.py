@@ -98,18 +98,35 @@ def retrieve_contexts(num_samples: int = 50) -> List[Dict]:
         
     samples = oracle["samples"][:num_samples]
     
+    logger.info("Initializing MAPLE Pipeline...")
+    indexer = MapleIndexer(device=DEVICE)
+    
+    # OVERRIDE: Prevent Crossed Latent Space by explicitly loading BGE weights
+    bge_weights = "models/maple_bge_small_en_v1.5.pth"
+    if not os.path.exists(bge_weights):
+        logger.error(f"MAPLE Net not found at {bge_weights}")
+        return []
+        
+    maple_net = MapleNet.load(bge_weights, device=DEVICE)
+    scanner = MapleScanner(maple_net, device=DEVICE)
+    
     eval_cache = []
     
     for i, s in enumerate(samples):
         question = s["question"]
         
-        # Directly extract the 5 answer-bearing blocks from the oracle data
-        oracle_ids = s.get("top_5_block_ids", [])
-        if not oracle_ids:
-            oracle_ids = list(s["all_block_texts"].keys())[:5]
+        # Build synthetic index
+        block_texts = list(s["all_block_texts"].values())
+        if len(block_texts) < 5:
+            continue
             
-        block_text_dict = s["all_block_texts"]
-        context_blocks = "\n---\n".join([block_text_dict[str(idx)] for idx in oracle_ids if str(idx) in block_text_dict])
+        index = indexer.create_index("\n\n".join(block_texts))
+        
+        # Search
+        res = scanner.search(indexer.encode_query(question), index, strategy="adaptive")
+        
+        # Extract Top-5 blocks text
+        context_blocks = "\n---\n".join([index.blocks[idx].text for idx in res.block_ids[:5]])
         
         # Match question to Native NarrativeQA for answers
         gt_answers = []
@@ -131,6 +148,15 @@ def retrieve_contexts(num_samples: int = 50) -> List[Dict]:
         if (i+1) % 10 == 0:
             logger.info(f"  Retrieved {i+1}/{len(samples)}")
             
+    # CRITICAL VRAM PURGE
+    logger.info("Purging MAPLE from VRAM...")
+    del scanner
+    del maple_net
+    del indexer
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        
     return eval_cache
 
 def _process_gemini_sample(item: Dict, model, delay: float) -> dict:
