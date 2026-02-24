@@ -3,8 +3,7 @@ import logging
 from typing import Callable, Tuple
 
 from maplecore.search import MapleScanner
-from maplecore.indexer import MapleIndexer
-from maplecore.core import Index
+from maplecore.indexer import MapleIndexer, Index
 from maplecore.context_manager import ContextSynthesizer
 from maplecore.prompt_templates import ORCHESTRATION_SYSTEM_PROMPT
 

@@ -108,3 +108,5 @@ benchmarks/results/
 data/
 models/
 research_log.md
+wandb/
+results/
