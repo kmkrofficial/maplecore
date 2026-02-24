@@ -110,77 +110,46 @@ def load_and_prepare_dataset(dataset_name: str, num_samples: int = 50):
         raise ValueError(f"Unknown dataset: {dataset_name}")
 
 def retrieve_contexts(dataset_name: str, num_samples: int = 50) -> List[Dict]:
-    """Uses MAPLE to fetch Top-5 blocks for the given dataset."""
+    """Prepares sample caches for the orchestrator."""
     logger.info(f"Loading {num_samples} {dataset_name} questions...")
     raw_samples = load_and_prepare_dataset(dataset_name, num_samples)
-    
-    logger.info("Initializing MAPLE Pipeline...")
-    indexer = MapleIndexer(device=DEVICE)
-    
-    # OVERRIDE: Prevent Crossed Latent Space by explicitly loading BGE weights
-    bge_weights = "models/maple_bge_small_en_v1.5.pth"
-    if not os.path.exists(bge_weights):
-        logger.error(f"MAPLE Net not found at {bge_weights}")
-        return []
-        
-    maple_net = MapleNet.load(bge_weights, device=DEVICE)
-    scanner = MapleScanner(maple_net, device=DEVICE)
     
     eval_cache = []
     
     for i, s in enumerate(raw_samples):
-        question = s["question"]
-        raw_context = s["context"]
-        gt_answers = s["ground_truths"]
-        
-        # Build index for this specific context
-        index = indexer.create_index(raw_context)
-        
-        if index.num_blocks == 0:
-            continue
-            
-        # Search
-        res = scanner.search(indexer.encode_query(question), index, strategy="adaptive")
-        
-        # Extract Top-5 blocks text
-        top_k = min(5, len(res.block_ids))
-        context_blocks = "\n---\n".join([index.blocks[idx].text for idx in res.block_ids[:top_k]])
-        
         eval_cache.append({
-            "question": question,
-            "context": context_blocks,
-            "ground_truths": gt_answers
+            "question": s["question"],
+            "raw_context": s["context"],
+            "ground_truths": s["ground_truths"]
         })
-        
-        if (i+1) % 10 == 0:
-            logger.info(f"  Retrieved {i+1}/{len(raw_samples)}")
-            
-    # CRITICAL VRAM PURGE
-    logger.info("Purging MAPLE from VRAM...")
-    del scanner
-    del maple_net
-    del indexer
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
         
     return eval_cache
 
-def _process_gemini_sample(item: Dict, model, delay: float) -> dict:
-    prompt = f"Context:\n{item['context']}\n\nQuestion: {item['question']}\nUsing the provided context, answer the question accurately and concisely. If the context does not contain the answer, output exactly 'Not found'."
+def _process_gemini_sample(item: Dict, model, orchestrator, delay: float) -> dict:
     
-    start_time = time.time()
-    try:
-        response = model.generate_content(prompt)
+    def llm_generator(prompt: str) -> str:
         try:
-            prediction = response.text
-        except ValueError:
-            # Safe fallback for empty parts where finish_reason is 1 (STOP)
-            prediction = ""
-    except Exception as e:
-        logger.warning(f"Gemini API error: {e}")
-        time.sleep(5)
-        prediction = ""
+            response = model.generate_content(prompt)
+            try:
+                return response.text
+            except ValueError:
+                return "Insufficient context"
+        except Exception as e:
+            logger.warning(f"Gemini API error: {e}")
+            time.sleep(5)
+            return "Insufficient context"
+
+    start_time = time.time()
+    
+    # Build a tiny local index for this sample's raw context
+    index = orchestrator.indexer.create_index(item["raw_context"])
+    
+    prediction, hop_count = orchestrator.generate_answer(
+        question=item["question"],
+        index=index,
+        llm_generator=llm_generator,
+        top_k=5
+    )
         
     latency = time.time() - start_time
     
@@ -195,10 +164,11 @@ def _process_gemini_sample(item: Dict, model, delay: float) -> dict:
         "prediction": prediction,
         "ground_truths": item["ground_truths"],
         "accuracy": score,
-        "latency_sec": latency
+        "latency_sec": latency,
+        "hop_count": hop_count
     }
 
-def evaluate_gemini_model(eval_cache: List[Dict], model_name: str, dataset_name: str, run) -> dict:
+def evaluate_gemini_model(eval_cache: List[Dict], model_name: str, dataset_name: str, orchestrator, run) -> dict:
     logger.info(f"Starting evaluations for {model_name}...")
     try:
         model = genai.GenerativeModel(model_name)
@@ -212,7 +182,7 @@ def evaluate_gemini_model(eval_cache: List[Dict], model_name: str, dataset_name:
     
     results = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(_process_gemini_sample, item, model, delay) for item in eval_cache]
+        futures = [executor.submit(_process_gemini_sample, item, model, orchestrator, delay) for item in eval_cache]
         for future in concurrent.futures.as_completed(futures):
             results.append(future.result())
             
@@ -221,13 +191,15 @@ def evaluate_gemini_model(eval_cache: List[Dict], model_name: str, dataset_name:
         
     avg_accuracy = np.mean([r["accuracy"] for r in results]) * 100
     avg_latency = np.mean([r["latency_sec"] for r in results])
+    avg_hops = np.mean([r["hop_count"] for r in results])
     
-    logger.info(f"  {model_name} - Accuracy: {avg_accuracy:.1f}%, Latency: {avg_latency:.2f}s")
+    logger.info(f"  {model_name} - Accuracy: {avg_accuracy:.1f}%, Latency: {avg_latency:.2f}s, Hops: {avg_hops:.1f}")
     
     if run:
         wandb.log({
             f"{dataset_name}/{model_name}/accuracy": avg_accuracy,
-            f"{dataset_name}/{model_name}/latency_sec": avg_latency
+            f"{dataset_name}/{model_name}/latency_sec": avg_latency,
+            f"{dataset_name}/{model_name}/hop_count": avg_hops
         })
         
     return {
@@ -239,7 +211,7 @@ def evaluate_gemini_model(eval_cache: List[Dict], model_name: str, dataset_name:
         "samples": results
     }
 
-def evaluate_all_gemini(eval_cache: List[Dict], dataset_name: str, run) -> List[dict]:
+def evaluate_all_gemini(eval_cache: List[Dict], dataset_name: str, orchestrator, run) -> List[dict]:
     if genai is None or not os.environ.get("GEMINI_API_KEY"):
         logger.warning("No GEMINI_API_KEY exported. Skipping Gemini Evaluations.")
         return []
@@ -249,7 +221,7 @@ def evaluate_all_gemini(eval_cache: List[Dict], dataset_name: str, run) -> List[
     all_reports = []
     # Launch all Gemini models in parallel using another ThreadPoolExecutor
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(GEMINI_MODELS)) as top_executor:
-        futures = [top_executor.submit(evaluate_gemini_model, eval_cache, model_name, dataset_name, run) for model_name in GEMINI_MODELS]
+        futures = [top_executor.submit(evaluate_gemini_model, eval_cache, model_name, dataset_name, orchestrator, run) for model_name in GEMINI_MODELS]
         for future in concurrent.futures.as_completed(futures):
             res = future.result()
             if res:
@@ -257,7 +229,7 @@ def evaluate_all_gemini(eval_cache: List[Dict], dataset_name: str, run) -> List[
                 
     return all_reports
 
-def evaluate_llama_local(eval_cache: List[Dict], dataset_name: str, run) -> dict:
+def evaluate_llama_local(eval_cache: List[Dict], dataset_name: str, orchestrator, run) -> dict:
     logger.info(f"Evaluating {LOCAL_LLM} locally in 4-bit...")
     try:
         from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, GenerationConfig
@@ -297,17 +269,27 @@ def evaluate_llama_local(eval_cache: List[Dict], dataset_name: str, run) -> dict
         
     results = []
     for i, item in enumerate(eval_cache):
-        prompt = f"Context:\n{item['context']}\n\nQuestion: {item['question']}\nUsing the provided context, answer the question accurately and concisely. If the context does not contain the answer, output exactly 'Not found'."
-        # Truncate prompt safely
-        prompt = prompt[:3500] 
         
+        def llm_generator(prompt: str) -> str:
+            # Truncate prompt safely
+            safe_prompt = prompt[:3500] 
+            try:
+                out = pipeline(safe_prompt, return_full_text=False)
+                return out[0]["generated_text"].strip()
+            except Exception as e:
+                logger.warning(f"Llama inference failed: {e}")
+                return "Insufficient context"
+
         start_time = time.time()
-        try:
-            out = pipeline(prompt, return_full_text=False)
-            prediction = out[0]["generated_text"].strip()
-        except Exception as e:
-            logger.warning(f"Llama inference failed: {e}")
-            prediction = ""
+        
+        index = orchestrator.indexer.create_index(item["raw_context"])
+        
+        prediction, hop_count = orchestrator.generate_answer(
+            question=item["question"],
+            index=index,
+            llm_generator=llm_generator,
+            top_k=5
+        )
             
         latency = time.time() - start_time
         
@@ -319,7 +301,8 @@ def evaluate_llama_local(eval_cache: List[Dict], dataset_name: str, run) -> dict
             "prediction": prediction,
             "ground_truths": item["ground_truths"],
             "accuracy": score,
-            "latency_sec": latency
+            "latency_sec": latency,
+            "hop_count": hop_count
         })
         
     if not results:
@@ -327,13 +310,15 @@ def evaluate_llama_local(eval_cache: List[Dict], dataset_name: str, run) -> dict
         
     avg_accuracy = np.mean([r["accuracy"] for r in results]) * 100
     avg_latency = np.mean([r["latency_sec"] for r in results])
+    avg_hops = np.mean([r["hop_count"] for r in results])
     
-    logger.info(f"  {LOCAL_LLM} - Accuracy: {avg_accuracy:.1f}%, Latency: {avg_latency:.2f}s")
+    logger.info(f"  {LOCAL_LLM} - Accuracy: {avg_accuracy:.1f}%, Latency: {avg_latency:.2f}s, Hops: {avg_hops:.1f}")
     
     if run:
         wandb.log({
             f"{dataset_name}/llama3_8b/accuracy": avg_accuracy,
-            f"{dataset_name}/llama3_8b/latency_sec": avg_latency
+            f"{dataset_name}/llama3_8b/latency_sec": avg_latency,
+            f"{dataset_name}/llama3_8b/hop_count": avg_hops
         })
         
     # CRITICAL VRAM PURGE
@@ -373,6 +358,19 @@ def main():
         
     all_reports = {}
     
+    from maplecore.orchestrator import RecursiveOrchestrator
+    
+    logger.info("Initializing MAPLE Pipeline & Orchestrator...")
+    indexer = MapleIndexer(device=DEVICE)
+    bge_weights = "models/maple_bge_small_en_v1.5.pth"
+    if not os.path.exists(bge_weights):
+        logger.error(f"MAPLE Net not found at {bge_weights}")
+        return
+        
+    maple_net = MapleNet.load(bge_weights, device=DEVICE)
+    scanner = MapleScanner(maple_net, device=DEVICE)
+    orchestrator = RecursiveOrchestrator(indexer=indexer, scanner=scanner, max_hops=3)
+
     for dataset_name in TARGET_DATASETS:
         print(f"\n--- Evaluating Dataset: {dataset_name} ---")
         eval_cache = retrieve_contexts(dataset_name=dataset_name, num_samples=50)
@@ -383,15 +381,25 @@ def main():
         dataset_reports = []
         
         # Run Gemini concurrently
-        gemini_reports = evaluate_all_gemini(eval_cache, dataset_name, run)
+        gemini_reports = evaluate_all_gemini(eval_cache, dataset_name, orchestrator, run)
         dataset_reports.extend(gemini_reports)
         
         # Run Llama sequentially
-        llama_report = evaluate_llama_local(eval_cache, dataset_name, run)
+        llama_report = evaluate_llama_local(eval_cache, dataset_name, orchestrator, run)
         if llama_report:
             dataset_reports.append(llama_report)
             
         all_reports[dataset_name] = dataset_reports
+        
+    # CRITICAL VRAM PURGE
+    logger.info("Purging MAPLE from VRAM...")
+    del orchestrator
+    del scanner
+    del maple_net
+    del indexer
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
         
     if run:
         run.finish()
