@@ -82,21 +82,37 @@ Respond with EXACTLY and ONLY the word "YES" if the answer is correct, or "NO" i
 
 
 
-def retrieve_contexts(num_samples: int = 50) -> List[Dict]:
-    """Uses MAPLE to fetch Top-5 blocks for NarrativeQA questions."""
-    logger.info(f"Loading {num_samples} NarrativeQA questions...")
-    ds = load_dataset("deepmind/narrativeqa", split="train")
-    
-    # We will use the Oracle data to avoid re-indexing full books in this script.
-    oracle_path = "data/oracle_data.json"
-    if not os.path.exists(oracle_path):
-        logger.error(f"Need {oracle_path} to provide block text corpuses.")
-        return []
-        
-    with open(oracle_path, "r", encoding="utf-8") as f:
-        oracle = json.load(f)
-        
-    samples = oracle["samples"][:num_samples]
+def load_and_prepare_dataset(dataset_name: str, num_samples: int = 50):
+    if dataset_name == "squad":
+        ds = load_dataset('squad', split='validation')
+        samples = []
+        for i, item in enumerate(ds):
+            if i >= num_samples: break
+            samples.append({
+                "question": item["question"],
+                "context": item["context"],
+                "ground_truths": item["answers"]["text"]
+            })
+        return samples
+    elif dataset_name == "hotpot_qa":
+        ds = load_dataset('hotpot_qa', 'distractor', split='validation')
+        samples = []
+        for i, item in enumerate(ds):
+            if i >= num_samples: break
+            context_str = " ".join([" ".join(sents) for sents in item["context"]["sentences"]])
+            samples.append({
+                "question": item["question"],
+                "context": context_str,
+                "ground_truths": [item["answer"]]
+            })
+        return samples
+    else:
+        raise ValueError(f"Unknown dataset: {dataset_name}")
+
+def retrieve_contexts(dataset_name: str, num_samples: int = 50) -> List[Dict]:
+    """Uses MAPLE to fetch Top-5 blocks for the given dataset."""
+    logger.info(f"Loading {num_samples} {dataset_name} questions...")
+    raw_samples = load_and_prepare_dataset(dataset_name, num_samples)
     
     logger.info("Initializing MAPLE Pipeline...")
     indexer = MapleIndexer(device=DEVICE)
@@ -112,33 +128,24 @@ def retrieve_contexts(num_samples: int = 50) -> List[Dict]:
     
     eval_cache = []
     
-    for i, s in enumerate(samples):
+    for i, s in enumerate(raw_samples):
         question = s["question"]
+        raw_context = s["context"]
+        gt_answers = s["ground_truths"]
         
-        # Build synthetic index
-        block_texts = list(s["all_block_texts"].values())
-        if len(block_texts) < 5:
+        # Build index for this specific context
+        index = indexer.create_index(raw_context)
+        
+        if index.num_blocks == 0:
             continue
             
-        index = indexer.create_index("\n\n".join(block_texts))
-        
         # Search
         res = scanner.search(indexer.encode_query(question), index, strategy="adaptive")
         
         # Extract Top-5 blocks text
-        context_blocks = "\n---\n".join([index.blocks[idx].text for idx in res.block_ids[:5]])
+        top_k = min(5, len(res.block_ids))
+        context_blocks = "\n---\n".join([index.blocks[idx].text for idx in res.block_ids[:top_k]])
         
-        # Match question to Native NarrativeQA for answers
-        gt_answers = []
-        for item in ds:
-            if item["question"]["text"] == question:
-                gt_answers = [ans["text"] for ans in item["answers"]]
-                break
-                
-        if not gt_answers:
-            # Fallback if somehow not found (unlikely)
-            gt_answers = ["Unknown"]
-            
         eval_cache.append({
             "question": question,
             "context": context_blocks,
@@ -146,7 +153,7 @@ def retrieve_contexts(num_samples: int = 50) -> List[Dict]:
         })
         
         if (i+1) % 10 == 0:
-            logger.info(f"  Retrieved {i+1}/{len(samples)}")
+            logger.info(f"  Retrieved {i+1}/{len(raw_samples)}")
             
     # CRITICAL VRAM PURGE
     logger.info("Purging MAPLE from VRAM...")
@@ -191,7 +198,7 @@ def _process_gemini_sample(item: Dict, model, delay: float) -> dict:
         "latency_sec": latency
     }
 
-def evaluate_gemini_model(eval_cache: List[Dict], model_name: str, run) -> dict:
+def evaluate_gemini_model(eval_cache: List[Dict], model_name: str, dataset_name: str, run) -> dict:
     logger.info(f"Starting evaluations for {model_name}...")
     try:
         model = genai.GenerativeModel(model_name)
@@ -219,8 +226,8 @@ def evaluate_gemini_model(eval_cache: List[Dict], model_name: str, run) -> dict:
     
     if run:
         wandb.log({
-            f"{model_name}/accuracy": avg_accuracy,
-            f"{model_name}/latency_sec": avg_latency
+            f"{dataset_name}/{model_name}/accuracy": avg_accuracy,
+            f"{dataset_name}/{model_name}/latency_sec": avg_latency
         })
         
     return {
@@ -232,7 +239,7 @@ def evaluate_gemini_model(eval_cache: List[Dict], model_name: str, run) -> dict:
         "samples": results
     }
 
-def evaluate_all_gemini(eval_cache: List[Dict], run) -> List[dict]:
+def evaluate_all_gemini(eval_cache: List[Dict], dataset_name: str, run) -> List[dict]:
     if genai is None or not os.environ.get("GEMINI_API_KEY"):
         logger.warning("No GEMINI_API_KEY exported. Skipping Gemini Evaluations.")
         return []
@@ -242,7 +249,7 @@ def evaluate_all_gemini(eval_cache: List[Dict], run) -> List[dict]:
     all_reports = []
     # Launch all Gemini models in parallel using another ThreadPoolExecutor
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(GEMINI_MODELS)) as top_executor:
-        futures = [top_executor.submit(evaluate_gemini_model, eval_cache, model_name, run) for model_name in GEMINI_MODELS]
+        futures = [top_executor.submit(evaluate_gemini_model, eval_cache, model_name, dataset_name, run) for model_name in GEMINI_MODELS]
         for future in concurrent.futures.as_completed(futures):
             res = future.result()
             if res:
@@ -250,7 +257,7 @@ def evaluate_all_gemini(eval_cache: List[Dict], run) -> List[dict]:
                 
     return all_reports
 
-def evaluate_llama_local(eval_cache: List[Dict], run) -> dict:
+def evaluate_llama_local(eval_cache: List[Dict], dataset_name: str, run) -> dict:
     logger.info(f"Evaluating {LOCAL_LLM} locally in 4-bit...")
     try:
         from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, GenerationConfig
@@ -325,8 +332,8 @@ def evaluate_llama_local(eval_cache: List[Dict], run) -> dict:
     
     if run:
         wandb.log({
-            f"llama3_8b/accuracy": avg_accuracy,
-            f"llama3_8b/latency_sec": avg_latency
+            f"{dataset_name}/llama3_8b/accuracy": avg_accuracy,
+            f"{dataset_name}/llama3_8b/latency_sec": avg_latency
         })
         
     # CRITICAL VRAM PURGE
@@ -353,6 +360,7 @@ def main():
     print("="*60)
     
     timestamp = time.strftime('%Y%m%d_%H%M%S')
+    TARGET_DATASETS = ["squad", "hotpot_qa"]
     
     run = None
     if wandb:
@@ -360,25 +368,30 @@ def main():
             project="maplecore", 
             name=f"e2e_{timestamp}", 
             group="e2e_evaluation",
-            tags=["generation"]
+            tags=["generation"] + TARGET_DATASETS
         )
-    
-    eval_cache = retrieve_contexts(num_samples=50)
-    if not eval_cache:
-        logger.error("Failed to construct evaluation caching. Exiting.")
-        if run: run.finish()
-        return
         
-    all_reports = []
+    all_reports = {}
     
-    # Run Gemini concurrently
-    gemini_reports = evaluate_all_gemini(eval_cache, run)
-    all_reports.extend(gemini_reports)
-    
-    # Run Llama sequentially
-    llama_report = evaluate_llama_local(eval_cache, run)
-    if llama_report:
-        all_reports.append(llama_report)
+    for dataset_name in TARGET_DATASETS:
+        print(f"\n--- Evaluating Dataset: {dataset_name} ---")
+        eval_cache = retrieve_contexts(dataset_name=dataset_name, num_samples=50)
+        if not eval_cache:
+            logger.error(f"Failed to construct evaluation caching for {dataset_name}. Skipping.")
+            continue
+            
+        dataset_reports = []
+        
+        # Run Gemini concurrently
+        gemini_reports = evaluate_all_gemini(eval_cache, dataset_name, run)
+        dataset_reports.extend(gemini_reports)
+        
+        # Run Llama sequentially
+        llama_report = evaluate_llama_local(eval_cache, dataset_name, run)
+        if llama_report:
+            dataset_reports.append(llama_report)
+            
+        all_reports[dataset_name] = dataset_reports
         
     if run:
         run.finish()
