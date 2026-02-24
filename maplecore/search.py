@@ -11,7 +11,7 @@ import logging
 import time
 from dataclasses import dataclass
 from enum import Enum
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 import torch
 
@@ -55,7 +55,7 @@ class MapleScanner:
     
     def __init__(
         self,
-        model: MapleNet,
+        model: Union[MapleNet, "MapleONNXRunner"],
         device: str = "cuda",
         confidence_threshold: float = 0.15,
         mass_target: float = 0.80,
@@ -73,9 +73,14 @@ class MapleScanner:
             max_blocks: Maximum blocks to return
             chapter_size: Blocks per chapter for hierarchical search
         """
-        self.model = model.to(device)
-        self.model.eval()
+        self.model = model
         self.device = device
+        
+        # Only PyTorch models need to be moved to device and set to eval
+        if hasattr(self.model, "to"):
+            self.model = self.model.to(device)
+        if hasattr(self.model, "eval"):
+            self.model.eval()
         
         self.confidence_threshold = confidence_threshold
         self.mass_target = mass_target
@@ -87,29 +92,57 @@ class MapleScanner:
     def _score_blocks(
         self, 
         query_emb: torch.Tensor, 
-        block_embs: torch.Tensor
+        block_embs: torch.Tensor,
+        batch_size: int = 32768
     ) -> torch.Tensor:
         """
-        Score all blocks using MAPLE model.
+        Score all blocks using MAPLE model in memory-safe batches.
         
         Args:
             query_emb: Query embedding [dim]
             block_embs: Block embeddings [N, dim]
+            batch_size: Chunks of blocks to process on GPU at once
             
         Returns:
-            Scores tensor [N]
+            Scores tensor [N] on CPU
         """
-        query_emb = query_emb.to(self.device)
-        block_embs = block_embs.to(self.device)
+        query_emb = query_emb.to(self.device).unsqueeze(0)
+        num_blocks = block_embs.shape[0]
+        
+        all_scores = []
         
         with torch.no_grad():
-            num_blocks = block_embs.shape[0]
-            query_expanded = query_emb.unsqueeze(0).expand(num_blocks, -1)
-            combined = torch.cat([query_expanded, block_embs], dim=1)
-            logits = self.model(combined)
-            scores = torch.sigmoid(logits)
-        
-        return scores
+            for i in range(0, num_blocks, batch_size):
+                # Transfer only this batch to GPU
+                batch_embs = block_embs[i:i + batch_size].to(self.device)
+                
+                # Expand query to match this batch's size
+                query_expanded = query_emb.expand(batch_embs.shape[0], -1)
+                
+                # Compute
+                combined = torch.cat([query_expanded, batch_embs], dim=1)
+                
+                # Check if model is an ONNX Runner (duck typing)
+                if hasattr(self.model, "predict"):
+                    # Convert to numpy, run prediction, convert back to tensor
+                    combined_np = combined.cpu().numpy()
+                    scores_np = self.model.predict(combined_np)
+                    # Convert back to tensor. Our ONNX predict already applied sigmoid.
+                    scores = torch.from_numpy(scores_np).float().to(self.device)
+                else:
+                    # Native PyTorch path
+                    logits = self.model(combined)
+                    scores = torch.sigmoid(logits)
+                
+                # Move results securely to CPU immediately
+                all_scores.append(scores.cpu())
+                
+                # Aggressive VRAM cleanup
+                del batch_embs, query_expanded, combined, logits, scores
+                if self.device == "cuda":
+                    torch.cuda.empty_cache()
+                    
+        return torch.cat(all_scores, dim=0)
     
     def search_linear(
         self,
@@ -301,8 +334,8 @@ class MapleScanner:
             end_idx = start_idx + self.chapter_size
             candidate_indices.extend(range(start_idx, min(end_idx, index.num_blocks)))
             
-        # Get candidate embeddings (transfer only needed blocks to device)
-        candidate_embs = index.embeddings[candidate_indices].to(self.device)
+        # Get candidate embeddings (keep on CPU; _score_blocks handles batch transfer)
+        candidate_embs = index.embeddings[candidate_indices]
         
         # --- Phase 4: Block Scoring & Result Selection ---
         block_scores = self._score_blocks(query_emb, candidate_embs)

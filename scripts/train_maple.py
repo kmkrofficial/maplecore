@@ -205,12 +205,16 @@ def run(
     lr: float = 1e-4,
     val_split: float = 0.2,
     device: str = "cuda",
+    embedding_model: str = "BAAI/bge-small-en-v1.5",
+    output_model_path: Optional[Path] = None,
 ):
     """Run the full training pipeline."""
+    target_model_path = output_model_path if output_model_path else MODEL_PATH
     print("=" * 70)
     print("MAPLE Model Trainer")
     print(f"  Oracle Data:  {ORACLE_PATH}")
-    print(f"  Output Model: {MODEL_PATH}")
+    print(f"  Encoder:      {embedding_model}")
+    print(f"  Output Model: {target_model_path}")
     print(f"  Epochs:       {epochs}")
     print(f"  Batch Size:   {batch_size}")
     print(f"  LR:           {lr}")
@@ -228,22 +232,24 @@ def run(
     # ---- Load oracle data ----
     oracle = load_oracle(ORACLE_PATH)
 
-    # ---- Build training data with BGE embeddings ----
-    indexer = MapleIndexer(device=device)    # this will lazy-load BGE
+    # ---- Build training data with dynamic embeddings ----
+    indexer = MapleIndexer(model_name=embedding_model, device=device)
     training_data = build_training_data(oracle, indexer)
 
     if len(training_data) < 10:
         logger.error("Not enough training data. Need at least 10 samples.")
         sys.exit(1)
 
+    # ---- Train ----
+    input_dim = indexer.get_embedding_dimension() * 2
+    
     # Free indexer GPU memory before training
     del indexer
     torch.cuda.empty_cache()
 
-    # ---- Train ----
     start = time.time()
     trainer = MapleTrainer(
-        input_dim=768,     # 384 (query) + 384 (block)
+        input_dim=input_dim,     # query dim + block dim
         hidden_dim=128,
         dropout=0.3,
         device=device,
@@ -257,7 +263,7 @@ def run(
         batch_size=batch_size,
         lr=lr,
         val_split=val_split,
-        save_path=str(MODEL_PATH),
+        save_path=str(target_model_path),
     )
 
     elapsed = time.time() - start
@@ -277,7 +283,7 @@ def run(
 
     # Verify model is loadable
     from maplecore import MapleNet
-    loaded = MapleNet.load(str(MODEL_PATH), device=device)
+    loaded = MapleNet.load(str(target_model_path), device=device)
     logger.info(f"Model verified: {loaded.num_parameters:,} params")
 
 

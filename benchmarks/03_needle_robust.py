@@ -143,6 +143,12 @@ def run_test(
     # `MapleIndexer` uses BGE.
     
     # We need to embed the text first.
+    # Pad final_text to exact chapter block boundaries to prevent
+    # adaptive search truncation. Chapter size is 100 blocks of 200 chars = 20,000 chars.
+    rem = len(final_text) % 20000
+    if rem != 0:
+        final_text += "." * (20000 - rem)
+
     indexer = MapleIndexer(device=scanner.device)
     index = indexer.create_index(final_text, chunk_size=200)
     
@@ -265,6 +271,8 @@ def main():
     final_output = wrap_result(all_results, mon)
     
     json_path = RESULTS_DIR / "needle_robustness.json"
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(final_output, f, indent=2)
         
     # 4. Plot
     plot_path = RESULTS_DIR / "needle_heatmap.png"

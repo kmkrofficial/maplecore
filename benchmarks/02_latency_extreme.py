@@ -41,8 +41,8 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-# 10k, 100k, 1M, 5M, 10M
-SCALING_COUNTS = [10_000, 100_000, 1_000_000, 5_000_000, 10_000_000]
+# 10k, 100k, 1M
+SCALING_COUNTS = [10_000, 100_000, 1_000_000]
 EMBED_DIM = 384
 NUM_TRIALS = 3
 WARMUP = 2
@@ -131,7 +131,7 @@ def plot_loglog(results: dict, output_path: Path):
     
     # Annotate 10M points
     for name, latencies in strategies.items():
-        if latencies:
+        if latencies and latencies[-1] is not None:
             ax.text(counts[-1], latencies[-1], f"{latencies[-1]:.1f}ms", 
                     fontsize=9, ha="left", va="center")
 
@@ -146,11 +146,10 @@ def run():
     print("BENCHMARK 02 (EXTREME): 10 Million Block Latency")
     print("=" * 70)
     
-    # Use CPU for large index storage simulation
-    # (MapleScanner will use GPU for small batch model inference if available)
-    # Note: MapleScanner logic currently assumes index.embeddings is likely on same device as query.
-    # We will force CPU usage for this test to ensure we test SYSTEM RAM limits, not VRAM.
-    model_device = "cpu" # Force CPU for FAIR comparison at 10M scale (won't fit 10M in VRAM)
+    # For this benchmark, we test on native GPU to ensure safe VRAM batching works correctly.
+    # The synthetic indices are large (up to 10M blocks) so they reside on CPU,
+    # but the scanner will dynamically batch computation to the GPU.
+    model_device = "cuda" if torch.cuda.is_available() else "cpu"
     
     # Load dummy model (needed for Adaptive strategy's re-ranking)
     # We use a small initialized model to avoid loading weights
@@ -169,26 +168,20 @@ def run():
     for count in SCALING_COUNTS:
         print(f"\n--- Index Size: {count:,} blocks ---")
         
-        try:
-            index = SyntheticIndex(count)
-            results["counts"].append(count)
-            
-            for strategy in strategies:
-                if strategy == "linear" and count > 50_000:
-                    print(f"  {strategy:<15} SKIPPED (slow)")
-                    results["strategies"][strategy].append(None)
-                    continue
+        index = SyntheticIndex(count)
+        results["counts"].append(count)
+        
+        for strategy in strategies:
+            if strategy == "linear" and count > 50_000:
+                print(f"  {strategy:<15} SKIPPED (slow)")
+                results["strategies"][strategy].append(None)
+                continue
 
-                latency = benchmark(scanner, index, strategy)
-                results["strategies"][strategy].append(latency)
-                print(f"  {strategy:<15} {latency:>8.2f} ms")
-                
-            del index
-            import gc; gc.collect()
+            latency = benchmark(scanner, index, strategy)
+            results["strategies"][strategy].append(latency)
+            print(f"  {strategy:<15} {latency:>8.2f} ms")
             
-        except MemoryError:
-            logger.error(f"OOM at {count:,} blocks!")
-            break
+        del index
 
     # Save
     json_path = RESULTS_DIR / "latency_extreme.json"

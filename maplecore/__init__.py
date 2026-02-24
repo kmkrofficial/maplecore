@@ -65,7 +65,7 @@ from .search import MapleScanner, SearchResult, SearchStrategy
 from .trainer import MapleTrainer
 from .utils import get_device, setup_logging
 
-__version__ = "0.1.0-alpha"
+__version__ = "0.2.0-beta"
 __author__ = "Keerthi Raajan K M"
 
 __all__ = [

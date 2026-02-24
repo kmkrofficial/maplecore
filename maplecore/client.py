@@ -35,6 +35,7 @@ class Maple:
     
     def __init__(
         self,
+        embedding_model: str = "BAAI/bge-small-en-v1.5",
         model_path: Optional[Union[str, Path]] = None,
         device: Optional[str] = None,
         chunk_size: int = 500,
@@ -44,6 +45,7 @@ class Maple:
         Initialize MAPLE client.
         
         Args:
+            embedding_model: HuggingFace model identifier
             model_path: Path to MAPLE model weights (.pth)
             device: Compute device ('cuda', 'cpu', or None for auto)
             chunk_size: Default chunk size for indexing
@@ -53,8 +55,10 @@ class Maple:
         self.chunk_size = chunk_size
         self.strategy = strategy
         
+        self.embedding_model = embedding_model
+        
         # Initialize components
-        self.indexer = MapleIndexer(device=self.device)
+        self.indexer = MapleIndexer(model_name=self.embedding_model, device=self.device)
         self._index: Optional[Index] = None
         self._scanner: Optional[MapleScanner] = None
         
@@ -71,7 +75,9 @@ class Maple:
         Args:
             path: Path to model weights
         """
-        model = MapleNet.load(path, device=self.device)
+        # Compute dynamic input dimension from the indexer model
+        required_dim = self.indexer.get_embedding_dimension() * 2
+        model = MapleNet.load(path, device=self.device, input_dim=required_dim)
         self._scanner = MapleScanner(model, device=self.device)
         logger.info(f"Model loaded from {path}")
     

@@ -28,6 +28,7 @@ wheels/
 venv/
 env/
 .venv/
+.env
 .env/
 ENV/
 
@@ -107,3 +108,5 @@ benchmarks/results/
 data/
 models/
 research_log.md
+wandb/
+results/

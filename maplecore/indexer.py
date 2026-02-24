@@ -57,11 +57,9 @@ class MapleIndexer:
     Handles text chunking, embedding generation, and index serialization.
     """
     
-    BGE_MODEL = "BAAI/bge-small-en-v1.5"
-    EMBEDDING_DIM = 384
-    
     def __init__(
         self, 
+        model_name: str = "BAAI/bge-small-en-v1.5",
         device: str = "cuda",
         batch_size: int = 32
     ) -> None:
@@ -69,9 +67,11 @@ class MapleIndexer:
         Initialize the indexer.
         
         Args:
+            model_name: HuggingFace model identifier
             device: Device for embedding computation
             batch_size: Batch size for encoding
         """
+        self.model_name = model_name
         self.device = device
         self.batch_size = batch_size
         self._model = None
@@ -80,12 +80,16 @@ class MapleIndexer:
     
     @property
     def model(self):
-        """Lazy-load the BGE model."""
+        """Lazy-load the embedding model."""
         if self._model is None:
             from sentence_transformers import SentenceTransformer
-            logger.info(f"Loading BGE model: {self.BGE_MODEL}")
-            self._model = SentenceTransformer(self.BGE_MODEL, device=self.device)
+            logger.info(f"Loading embedding model: {self.model_name}")
+            self._model = SentenceTransformer(self.model_name, device=self.device, trust_remote_code=True)
         return self._model
+        
+    def get_embedding_dimension(self) -> int:
+        """Dynamically get the dimension of the loaded embedding model."""
+        return self.model.get_sentence_embedding_dimension()
     
     def chunk_text(
         self, 
@@ -201,16 +205,17 @@ class MapleIndexer:
         Create an index from a file.
         
         Args:
-            path: Path to text file
+            path: Path to document file (.txt, .pdf, .docx, .html)
             chunk_size: Characters per block
-            encoding: File encoding
+            encoding: File encoding (ignored for rich documents)
             
         Returns:
             Index object
         """
+        from .parsers import extract_text_from_file
+        
         path = Path(path)
-        with open(path, "r", encoding=encoding) as f:
-            text = f.read()
+        text = extract_text_from_file(path)
         
         return self.create_index(text, chunk_size, str(path))
     
