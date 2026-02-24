@@ -15,6 +15,7 @@ import logging
 import time
 import string
 import concurrent.futures
+import argparse
 from typing import List, Dict
 
 from dotenv import load_dotenv
@@ -125,7 +126,7 @@ def retrieve_contexts(dataset_name: str, num_samples: int = 50) -> List[Dict]:
         
     return eval_cache
 
-def _process_gemini_sample(item: Dict, model, orchestrator, delay: float) -> dict:
+def _process_gemini_sample(item: Dict, model, orchestrator, delay: float, agentic_search: bool = False) -> dict:
     
     def llm_generator(prompt: str) -> str:
         try:
@@ -144,12 +145,22 @@ def _process_gemini_sample(item: Dict, model, orchestrator, delay: float) -> dic
     # Build a tiny local index for this sample's raw context
     index = orchestrator.indexer.create_index(item["raw_context"])
     
-    prediction, hop_count = orchestrator.generate_answer(
-        question=item["question"],
-        index=index,
-        llm_generator=llm_generator,
-        top_k=5
-    )
+    if agentic_search:
+        prediction, hop_count = orchestrator.generate_answer(
+            question=item["question"],
+            index=index,
+            llm_generator=llm_generator,
+            top_k=5
+        )
+    else:
+        # Standard Single-Pass Retrieval (The Librarian)
+        res = orchestrator.scanner.search(orchestrator.indexer.encode_query(item["question"]), index, strategy="adaptive")
+        k = min(5, len(res.block_ids))
+        chunks = [index.blocks[idx].text for idx in res.block_ids[:k]]
+        context_str = "\n".join(chunks)
+        prompt = f"Context:\n{context_str}\n\nQuestion: {item['question']}\n\nAnswer the question concisely using the context. If the context does not fully contain the answer, output 'Insufficient context'."
+        prediction = llm_generator(prompt)
+        hop_count = 0
         
     latency = time.time() - start_time
     
@@ -168,7 +179,7 @@ def _process_gemini_sample(item: Dict, model, orchestrator, delay: float) -> dic
         "hop_count": hop_count
     }
 
-def evaluate_gemini_model(eval_cache: List[Dict], model_name: str, dataset_name: str, orchestrator, run) -> dict:
+def evaluate_gemini_model(eval_cache: List[Dict], model_name: str, dataset_name: str, orchestrator, run, agentic_search: bool = False) -> dict:
     logger.info(f"Starting evaluations for {model_name}...")
     try:
         model = genai.GenerativeModel(model_name)
@@ -182,7 +193,7 @@ def evaluate_gemini_model(eval_cache: List[Dict], model_name: str, dataset_name:
     
     results = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(_process_gemini_sample, item, model, orchestrator, delay) for item in eval_cache]
+        futures = [executor.submit(_process_gemini_sample, item, model, orchestrator, delay, agentic_search) for item in eval_cache]
         for future in concurrent.futures.as_completed(futures):
             results.append(future.result())
             
@@ -211,7 +222,7 @@ def evaluate_gemini_model(eval_cache: List[Dict], model_name: str, dataset_name:
         "samples": results
     }
 
-def evaluate_all_gemini(eval_cache: List[Dict], dataset_name: str, orchestrator, run) -> List[dict]:
+def evaluate_all_gemini(eval_cache: List[Dict], dataset_name: str, orchestrator, run, agentic_search: bool = False) -> List[dict]:
     if genai is None or not os.environ.get("GEMINI_API_KEY"):
         logger.warning("No GEMINI_API_KEY exported. Skipping Gemini Evaluations.")
         return []
@@ -221,7 +232,7 @@ def evaluate_all_gemini(eval_cache: List[Dict], dataset_name: str, orchestrator,
     all_reports = []
     # Launch all Gemini models in parallel using another ThreadPoolExecutor
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(GEMINI_MODELS)) as top_executor:
-        futures = [top_executor.submit(evaluate_gemini_model, eval_cache, model_name, dataset_name, orchestrator, run) for model_name in GEMINI_MODELS]
+        futures = [top_executor.submit(evaluate_gemini_model, eval_cache, model_name, dataset_name, orchestrator, run, agentic_search) for model_name in GEMINI_MODELS]
         for future in concurrent.futures.as_completed(futures):
             res = future.result()
             if res:
@@ -229,7 +240,7 @@ def evaluate_all_gemini(eval_cache: List[Dict], dataset_name: str, orchestrator,
                 
     return all_reports
 
-def evaluate_llama_local(eval_cache: List[Dict], dataset_name: str, orchestrator, run) -> dict:
+def evaluate_llama_local(eval_cache: List[Dict], dataset_name: str, orchestrator, run, agentic_search: bool = False) -> dict:
     logger.info(f"Evaluating {LOCAL_LLM} locally in 4-bit...")
     try:
         from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, GenerationConfig
@@ -284,12 +295,23 @@ def evaluate_llama_local(eval_cache: List[Dict], dataset_name: str, orchestrator
         
         index = orchestrator.indexer.create_index(item["raw_context"])
         
-        prediction, hop_count = orchestrator.generate_answer(
-            question=item["question"],
-            index=index,
-            llm_generator=llm_generator,
-            top_k=5
-        )
+        if agentic_search:
+            prediction, hop_count = orchestrator.generate_answer(
+                question=item["question"],
+                index=index,
+                llm_generator=llm_generator,
+                top_k=5
+            )
+        else:
+            # Standard Single-Pass Retrieval (The Librarian)
+            query_emb = orchestrator.indexer.encode_query(item["question"])
+            res = orchestrator.scanner.search(query_emb, index, strategy="adaptive")
+            k = min(5, len(res.block_ids))
+            chunks = [index.blocks[idx].text for idx in res.block_ids[:k]]
+            context_str = "\n".join(chunks)
+            prompt = f"Context:\n{context_str}\n\nQuestion: {item['question']}\n\nAnswer the question concisely using the context. If the context does not fully contain the answer, output 'Insufficient context'."
+            prediction = llm_generator(prompt)
+            hop_count = 0
             
         latency = time.time() - start_time
         
@@ -340,8 +362,13 @@ def evaluate_llama_local(eval_cache: List[Dict], dataset_name: str, orchestrator
     }
 
 def main():
+    parser = argparse.ArgumentParser(description="Run MAPLE E2E Benchmarks")
+    parser.add_argument("--enable-agentic-search", action="store_true", help="Enable experimental multi-hop Recursive Orchestrator")
+    args = parser.parse_args()
+
     print("="*60)
     print("Benchmark 06: E2E Generation Metrics")
+    print(f"Agentic Search Enabled: {args.enable_agentic_search}")
     print("="*60)
     
     timestamp = time.strftime('%Y%m%d_%H%M%S')
@@ -353,7 +380,8 @@ def main():
             project="maplecore", 
             name=f"e2e_{timestamp}", 
             group="e2e_evaluation",
-            tags=["generation"] + TARGET_DATASETS
+            tags=["generation"] + TARGET_DATASETS,
+            config={"agentic_search": args.enable_agentic_search}
         )
         
     all_reports = {}
@@ -381,11 +409,11 @@ def main():
         dataset_reports = []
         
         # Run Gemini concurrently
-        gemini_reports = evaluate_all_gemini(eval_cache, dataset_name, orchestrator, run)
+        gemini_reports = evaluate_all_gemini(eval_cache, dataset_name, orchestrator, run, args.enable_agentic_search)
         dataset_reports.extend(gemini_reports)
         
         # Run Llama sequentially
-        llama_report = evaluate_llama_local(eval_cache, dataset_name, orchestrator, run)
+        llama_report = evaluate_llama_local(eval_cache, dataset_name, orchestrator, run, args.enable_agentic_search)
         if llama_report:
             dataset_reports.append(llama_report)
             
