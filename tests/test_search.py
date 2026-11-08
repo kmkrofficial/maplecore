@@ -124,3 +124,48 @@ def test_onnx_export_matches_torch(tmp_path):
     res_t = MapleScanner(m, device="cpu").search(torch.randn(16), index, k=5, strategy="linear")
     res_o = MapleScanner(runner, device="cpu").search(torch.randn(16), index, k=5, strategy="linear")
     assert res_o.num_results == res_t.num_results == 5
+
+
+# ------------------------------------------------------------------ two-stage rerank (Task 12)
+
+def test_rerank_results_subset_of_dense_prefilter(dot_model):
+    index = make_index(5000)
+    q = torch.randn(16)
+    res = MapleScanner(dot_model, device="cpu").search_rerank(q, index, k=10, candidates=100)
+    dense = torch.nn.functional.normalize(index.embeddings, dim=1) @ (q / q.norm())
+    dense_top = set(torch.topk(dense, 100).indices.tolist())
+    assert set(res.block_ids) <= dense_top
+    assert res.metadata["blocks_scored"] == 100 and res.strategy_used == "rerank" and res.num_results == 10
+
+
+def test_rerank_equals_linear_when_candidates_cover_index(dot_model):
+    index = make_index(150)
+    q = _plant(index, 149)
+    s = MapleScanner(dot_model, device="cpu")
+    assert s.search_rerank(q, index, k=5, candidates=1000).block_ids == s.search_linear(q, index, k=5).block_ids
+
+
+def test_rerank_finds_planted_block_via_search_dispatch(dot_model):
+    index = make_index(2000)
+    q = _plant(index, 1234)
+    res = MapleScanner(dot_model, device="cpu").search(q, index, k=5, strategy="rerank")
+    assert res.block_ids[0] == 1234
+
+
+def test_rerank_small_index(dot_model):
+    res = MapleScanner(dot_model, device="cpu").search(torch.randn(16), make_index(3), k=5, strategy="rerank")
+    assert res.num_results == 3
+
+
+def test_normalized_embeddings_are_cached_and_unit_norm():
+    index = make_index(50)
+    n1 = index.normalized_embeddings()
+    assert torch.allclose(n1.norm(dim=1), torch.ones(50), atol=1e-5)
+    assert index.normalized_embeddings() is n1
+
+
+def test_client_default_strategy_is_rerank():
+    import inspect
+    from maplecore import Maple
+
+    assert inspect.signature(Maple.__init__).parameters["strategy"].default == "rerank"

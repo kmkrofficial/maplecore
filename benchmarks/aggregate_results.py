@@ -295,18 +295,23 @@ def long_context_variant_tables(root: Path) -> tuple[list[str], dict]:
     return lines, data
 
 
-def latency_table() -> list[str]:
-    f = RESULTS_DIR / "latency" / "latency_results.json"
+def latency_table(path: Path | None = None) -> list[str]:
+    """Search latency vs index size from benchmark 02 (p50 / p95 ms per strategy; rows per device)."""
+    f = Path(path) if path else RESULTS_DIR / "latency" / "latency_results.json"
     if not f.exists():
         return []
     res = json.loads(f.read_text(encoding="utf-8"))
     rows = res.get("metrics", res)
+    strategies = ["linear", "hierarchical", "adaptive", "rerank", "dense"]
     lines = ["\n### Search latency vs index size (benchmark 02, real BGE embeddings, p50 / p95 ms)\n",
-             "| blocks | linear | hierarchical | adaptive | linear ÷ adaptive |", "|---|---|---|---|---|"]
+             "| blocks | device | " + " | ".join(strategies) + " | linear ÷ rerank |",
+             "|---|---|" + "---|" * (len(strategies) + 1)]
     for r in rows:
         t = r.get("latency_ms", {})
-        cell = lambda s: f"{t[s]['p50']:.2f} / {t[s]['p95']:.2f}" if s in t else "n/a"
-        lines.append(f"| {r['n_blocks']:,} | {cell('linear')} | {cell('hierarchical')} | {cell('adaptive')} | {r['speedup']:.1f}× |")
+        cells = [f"{t[s]['p50']:.2f} / {t[s]['p95']:.2f}" if s in t else "n/a" for s in strategies]
+        sp = r.get("rerank_speedup")
+        lines.append(f"| {r['n_blocks']:,} | {r.get('device', 'n/a')} | " + " | ".join(cells)
+                     + f" | {'n/a' if sp is None else f'{sp:.1f}×'} |")
     return lines
 
 

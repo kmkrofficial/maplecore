@@ -51,6 +51,7 @@ class Index:
     _chapter_cache: Dict[int, torch.Tensor] = field(
         default_factory=dict, repr=False, compare=False
     )
+    _normalized: Optional[torch.Tensor] = field(default=None, repr=False, compare=False)
 
     @property
     def num_blocks(self) -> int:
@@ -63,6 +64,14 @@ class Index:
         if self.embeddings is not None:
             return self.embeddings.shape[1]
         return 0
+
+    def normalized_embeddings(self) -> torch.Tensor:
+        """Unit-norm copy of the block embeddings (float32), computed once and cached.
+
+        Dense pre-filtering is then a single matrix-vector product. Do not mutate ``embeddings`` afterwards."""
+        if self._normalized is None:
+            self._normalized = torch.nn.functional.normalize(self.embeddings.float(), dim=1)
+        return self._normalized
 
     def chapter_embeddings(self, chapter_size: int) -> torch.Tensor:
         """

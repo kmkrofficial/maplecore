@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from benchmarks.aggregate_results import long_context_variant_tables, variant_tables
+from benchmarks.aggregate_results import latency_table, long_context_variant_tables, variant_tables
 
 
 def _summ(mean, n=100):
@@ -95,3 +95,33 @@ def test_long_context_variant_table(tmp_path):
 def test_long_context_variant_table_empty_without_results(tmp_path):
     (tmp_path / "A1_b1536_s42").mkdir()
     assert long_context_variant_tables(tmp_path) == ([], {})
+
+
+def _lat(p50):
+    return {"p50": p50, "p95": p50 * 1.5}
+
+
+def test_latency_table_has_device_rerank_and_dense_columns(tmp_path):
+    rows = [{"n_blocks": 1_000_000, "device": "cuda", "speedup": 10.0, "rerank_speedup": 150.0,
+             "latency_ms": {"linear": _lat(30.0), "hierarchical": _lat(2.0), "adaptive": _lat(3.0),
+                            "rerank": _lat(0.2), "dense": _lat(0.15)}},
+            {"n_blocks": 100_000, "device": "cpu", "speedup": 2.0, "rerank_speedup": 20.0,
+             "latency_ms": {"linear": _lat(40.0), "hierarchical": _lat(8.0), "adaptive": _lat(9.0),
+                            "rerank": _lat(2.0), "dense": _lat(1.8)}}]
+    f = tmp_path / "latency_results.json"
+    f.write_text(json.dumps({"metrics": rows}), encoding="utf-8")
+    text = "\n".join(latency_table(f))
+    assert "| 1,000,000 | cuda |" in text and "| 100,000 | cpu |" in text
+    assert "0.20 / 0.30" in text                      # rerank p50 / p95 on the GPU row
+    assert "150.0×" in text and "rerank" in text and "dense" in text
+
+
+def test_latency_table_reads_legacy_rows_without_device(tmp_path):
+    rows = [{"n_blocks": 10_000, "speedup": 1.0, "latency_ms": {"linear": _lat(1.0), "adaptive": _lat(1.0)}}]
+    f = tmp_path / "latency_results.json"
+    f.write_text(json.dumps({"metrics": rows}), encoding="utf-8")
+    assert "| 10,000 | n/a |" in "\n".join(latency_table(f))
+
+
+def test_latency_table_missing_file_is_empty(tmp_path):
+    assert latency_table(tmp_path / "nope.json") == []

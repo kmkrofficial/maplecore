@@ -32,6 +32,7 @@ class SearchStrategy(Enum):
     LINEAR = "linear"
     HIERARCHICAL = "hierarchical"
     ADAPTIVE = "adaptive"
+    RERANK = "rerank"
 
 
 @dataclass
@@ -78,6 +79,7 @@ class MapleScanner:
         fallback_chapters: int = 50,
         entropy_threshold: Optional[float] = None,
         score_batch_size: int = 32768,
+        rerank_candidates: int = 200,
     ) -> None:
         """
         Initialize the scanner.
@@ -97,6 +99,7 @@ class MapleScanner:
                 back when the *normalised* chapter-score entropy (0..1) is
                 above this value, i.e. the chapter scores are flat.
             score_batch_size: Blocks scored per forward pass
+            rerank_candidates: Blocks kept by the dense pre-filter in ``rerank`` search
         """
         self.model = model
         self.device = resolve_device(device)
@@ -115,6 +118,7 @@ class MapleScanner:
         self.fallback_chapters = fallback_chapters
         self.entropy_threshold = entropy_threshold
         self.score_batch_size = score_batch_size
+        self.rerank_candidates = rerank_candidates
 
         logger.info(f"MapleScanner initialized (device={self.device})")
 
@@ -329,6 +333,45 @@ class MapleScanner:
             }
         )
 
+    def search_rerank(
+        self,
+        query_emb: torch.Tensor,
+        index: Index,
+        k: int = 5,
+        candidates: Optional[int] = None
+    ) -> SearchResult:
+        """
+        Two-stage search: cosine pre-filter, then MAPLE scores only the survivors.
+
+        1. one matrix-vector product against the cached unit-norm embeddings keeps the
+           ``candidates`` (default ``rerank_candidates``) most similar blocks;
+        2. the MAPLE scorer ranks those candidates and the top ``k`` are returned.
+        Cost is O(N) for a dot product plus O(candidates) model evaluations, instead of the O(N) model
+        evaluations of linear search. With ``candidates >= N`` it equals linear search.
+        """
+        start = time.perf_counter()
+        n = index.num_blocks
+        m = min(max(candidates or self.rerank_candidates, k), n)
+
+        if m >= n:
+            cand = torch.arange(n)
+        else:
+            normed = index.normalized_embeddings()
+            q = torch.nn.functional.normalize(query_emb.float().to(normed.device), dim=0)
+            cand = torch.topk(normed @ q, m).indices.cpu()
+
+        scores = self._score_blocks(query_emb, index.embeddings[cand.to(index.embeddings.device)])
+        top_scores, top_rel = torch.topk(scores, min(k, len(scores)))
+
+        latency = (time.perf_counter() - start) * 1000
+        return SearchResult(
+            block_ids=cand[top_rel].tolist(),
+            scores=top_scores.tolist(),
+            strategy_used="rerank",
+            latency_ms=latency,
+            metadata={"candidates": m, "blocks_scored": m}
+        )
+
     def search(
         self,
         query_emb: torch.Tensor,
@@ -350,5 +393,7 @@ class MapleScanner:
             return self.search_hierarchical(query_emb, index, k)
         elif strategy == "adaptive":
             return self.search_adaptive(query_emb, index, k)
+        elif strategy == "rerank":
+            return self.search_rerank(query_emb, index, k)
         else:
             raise ValueError(f"Unknown strategy: {strategy}")

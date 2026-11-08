@@ -39,7 +39,7 @@ class Maple:
         model_path: Optional[Union[str, Path]] = None,
         device: Optional[str] = None,
         chunk_size: int = 500,
-        strategy: str = "adaptive"
+        strategy: str = "rerank"
     ) -> None:
         """
         Initialize MAPLE client.
@@ -49,7 +49,7 @@ class Maple:
             model_path: Path to MAPLE model weights (.pth)
             device: Compute device ('cuda', 'cpu', or None for auto)
             chunk_size: Default chunk size for indexing
-            strategy: Default search strategy ('linear', 'hierarchical', 'adaptive')
+            strategy: Default search strategy ('rerank', 'linear', 'hierarchical', 'adaptive')
         """
         self.device = device or str(get_device())
         self.chunk_size = chunk_size
