@@ -153,6 +153,8 @@ encoder, MAPLE checkpoint (+ training seed), and the git commit.
 ## 10. Numbers that must not be reused
 
 The v0.2.0 figures (">95% recall", "71% Recall@5", "98% Recall@1", "98%
-SQuAD", ">90% needle") were produced by code with the bugs listed in
-[GAPS.md](GAPS.md) (B1, C3–C5, D3–D6) and cannot be reproduced from this
-repository. They are kept only in `docs/archive/` for history.
+SQuAD", ">90% needle") were produced by code with known bugs — unreachable
+trailing blocks in hierarchical search, mislabelled training block ids, needle
+templates shared between training and test, padding that hid the search bug,
+and QA contexts too short to exercise retrieval — and cannot be reproduced from
+this repository. They are kept only in `docs/archive/` for history.

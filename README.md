@@ -5,8 +5,8 @@ selection for long-document LLM question answering.
 
 > **Status: research experiment (v0.2.0-beta → v0.3 in progress).** There is no
 > paper and no validated result yet. Numbers from earlier versions were affected
-> by bugs and are archived, not claimed. See [docs/GAPS.md](docs/GAPS.md) for
-> the known-issues tracker.
+> by bugs and are archived, not claimed (see
+> [docs/METRICS.md §10](docs/METRICS.md#10-numbers-that-must-not-be-reused)).
 
 ## Idea
 
@@ -101,7 +101,8 @@ python benchmarks/06_e2e_generation.py       # needs GEMINI_API_KEY in .env
 | [`benchmarks/`](benchmarks/README.md) | Evaluation suite and shared metrics |
 | [`examples/`](examples/README.md) | Small usage and verification scripts |
 | [`tests/`](tests/) | Unit tests (`pytest`); no downloads needed |
-| [`docs/`](docs/) | [GAPS](docs/GAPS.md) · [METRICS](docs/METRICS.md) · [DATA](docs/DATA.md) · [archive](docs/archive/) |
+| [`docs/`](docs/) | [METRICS](docs/METRICS.md) · [DATA](docs/DATA.md) · [RELATED_WORK](docs/RELATED_WORK.md) · [archive](docs/archive/) |
+| `docs/private/`, `scratch/` | Local-only notes and scratch work — gitignored, never committed |
 
 ## Development
 
