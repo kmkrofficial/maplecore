@@ -128,4 +128,7 @@ def run():
 
 
 if __name__ == "__main__":
-    run()
+    from scripts.runlog import record_outputs, start_run
+    with start_run("bench", "04_cost", {}) as _run:
+        run()
+        record_outputs(_run, RESULTS_DIR / 'cost_savings.json', RESULTS_DIR / 'cost_savings_all.json')

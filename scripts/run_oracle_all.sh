@@ -22,7 +22,8 @@ run() {  # name, command...
   local name="$1"; shift
   echo "[$(date +%H:%M:%S)] START $name"
   "$@" --resume > "logs/oracle_${name}.log" 2>&1
-  echo "[$(date +%H:%M:%S)] DONE  $name ($(tail -n 3 "logs/oracle_${name}.log" | head -n 1))"
+  local rid; rid=$(grep -m1 '^\[runlog\] run ' "logs/oracle_${name}.log" | cut -d' ' -f3 || true)
+  echo "[$(date +%H:%M:%S)] DONE  $name run=${rid:-?} ($(tail -n 3 "logs/oracle_${name}.log" | head -n 1))"
 }
 
 for T in 1536 4096; do

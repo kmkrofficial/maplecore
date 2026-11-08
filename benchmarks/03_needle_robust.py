@@ -7,7 +7,7 @@ Inserts a single out-of-place fact ("needle") into real book text
 (Alice in Wonderland, Gutenberg #11, tiled if needed) at a given depth and
 checks whether the block(s) covering the needle are retrieved in the top-k.
 
-Changes vs v0.2.0 (see docs/GAPS.md D6, C5, B1):
+Changes vs v0.2.0:
   * Needle templates are HELD OUT: disjoint from the synthetic training
     templates in scripts/train_generalist.py.
   * No padding of the text to chapter boundaries (the search bug it hid is fixed).
@@ -195,4 +195,7 @@ if __name__ == "__main__":
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default=None)
     a = p.parse_args()
-    run(a.lengths, a.depths, a.trials, a.model, a.embedding_model, a.seed, a.device)
+    from scripts.runlog import flatten_metrics, record_outputs, start_run
+    with start_run("bench", "03_needle", vars(a)) as _run:
+        _run.log_metrics(flatten_metrics(run(a.lengths, a.depths, a.trials, a.model, a.embedding_model, a.seed, a.device)))
+        record_outputs(_run, RESULTS_DIR / 'needle_robustness.json')

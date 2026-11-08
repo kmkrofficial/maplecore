@@ -24,18 +24,19 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from maplecore import MapleNet, MapleIndexer, MapleScanner
-from maplecore.indexer import Block, Index
+from maplecore.indexer import Index
 from benchmarks.config import (
     RESULTS_DIR, MODEL_PATH, DEFAULT_DEVICE, CHUNK_SIZE,
     SCALING_BLOCK_COUNTS,
 )
 from benchmarks.data_loader import build_large_corpus
+from benchmarks.profiler import HardwareMonitor, wrap_result
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 NUM_WARMUP = 3
-NUM_TRIALS = 10
+NUM_TRIALS = 20
 
 
 def _create_synthetic_index(indexer: MapleIndexer, num_blocks: int) -> Index:
@@ -123,24 +124,36 @@ def run():
             # Prepare a query
             query_emb = indexer.encode_query("What is the significance of the red herring?")
 
-            # Linear Search Profile
-            start = time.perf_counter()
-            for _ in range(NUM_TRIALS): # Use NUM_TRIALS for consistency
-                scanner.search(query_emb, index, k=5, strategy="linear")
-            lin_time = (time.perf_counter() - start) / NUM_TRIALS * 1000
-            
-            # Adaptive Search Profile
-            start = time.perf_counter()
-            for _ in range(NUM_TRIALS): # Use NUM_TRIALS for consistency
-                scanner.search(query_emb, index, k=5, strategy="adaptive")
-            adp_time = (time.perf_counter() - start) / NUM_TRIALS * 1000
-            
+            # Warm-up (also builds the cached chapter embeddings once)
+            for strat in ("linear", "hierarchical", "adaptive"):
+                scanner.search(query_emb, index, k=5, strategy=strat)
+
+            timings = {}
+            for strat in ("linear", "hierarchical", "adaptive"):
+                samples = []
+                for _ in range(NUM_TRIALS):
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    t0 = time.perf_counter()
+                    scanner.search(query_emb, index, k=5, strategy=strat)
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    samples.append((time.perf_counter() - t0) * 1000)
+                samples.sort()
+                timings[strat] = {"p50": samples[len(samples) // 2],
+                                  "p95": samples[min(len(samples) - 1, int(0.95 * len(samples)))]}
+                print(f"  {strat:<12} p50={timings[strat]['p50']:.2f} ms  p95={timings[strat]['p95']:.2f} ms")
+            lin_time = timings["linear"]["p50"]
+            adp_time = timings["adaptive"]["p50"]
+
         stats = mon.get_stats()
         
         metrics.append({
             "n_blocks": n,
             "linear_time_ms": lin_time,
             "adaptive_time_ms": adp_time,
+            "hierarchical_time_ms": timings["hierarchical"]["p50"],
+            "latency_ms": timings,
             "speedup": lin_time / adp_time if adp_time > 0 else 0.0,
             "hardware_usage": stats
         })
@@ -165,4 +178,7 @@ def run():
 
 
 if __name__ == "__main__":
-    run()
+    from scripts.runlog import record_outputs, start_run
+    with start_run("bench", "02_latency", {}) as _run:
+        run()
+        record_outputs(_run, RESULTS_DIR / 'latency_results.json')

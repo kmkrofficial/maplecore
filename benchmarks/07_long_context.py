@@ -294,4 +294,7 @@ if __name__ == "__main__":
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default=None)
     a = p.parse_args()
-    run(a.model, a.embedding_model, a.datasets, a.max_questions, a.pool_sizes, a.seed, a.device)
+    from scripts.runlog import flatten_metrics, record_outputs, start_run
+    with start_run("bench", "07_long_context", vars(a)) as _run:
+        _run.log_metrics(flatten_metrics(run(a.model, a.embedding_model, a.datasets, a.max_questions, a.pool_sizes, a.seed, a.device)))
+        record_outputs(_run, RESULTS_DIR / 'long_context.json', RESULTS_DIR / 'long_context_baselines.json')

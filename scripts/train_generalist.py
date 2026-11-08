@@ -39,6 +39,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from maplecore import MapleIndexer, MapleTrainer
 from scripts.oracle_common import load_oracle_samples
+from scripts.runlog import current_run, write_model_card
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
 logger = logging.getLogger(__name__)
@@ -145,6 +146,7 @@ def run(
     device: Optional[str] = None,
     seed: int = 42,
     max_samples_per_dataset: Optional[int] = None,
+    oracle_dir: Path = ORACLE_DIR,
 ) -> dict:
     """Train and save a MAPLE model. Returns a summary dict."""
     random.seed(seed)
@@ -154,7 +156,7 @@ def run(
     rows: List[Dict] = []
     used = {}
     for name in datasets:
-        path = DATASET_FILES[name]
+        path = Path(oracle_dir) / DATASET_FILES[name].name
         if not path.exists():
             raise FileNotFoundError(f"{path} missing. Generate it first (see docs/DATA.md).")
         samples = load_oracle_samples(path)
@@ -184,6 +186,7 @@ def run(
         "output_model": str(output_model_path),
         "embedding_model": embedding_model,
         "datasets": used,
+        "oracle_dir": str(oracle_dir),
         "rows": len(rows),
         "positives": int(pos),
         "epochs": epochs,
@@ -193,6 +196,14 @@ def run(
         "best_val_recall@5": best_recall,
         "history": trainer.history_,
     }
+    cur = current_run()
+    if cur is not None:  # keep per-epoch metrics, the checkpoint and a model card in the run registry
+        cur.config["data_files"] = [str(Path(oracle_dir) / DATASET_FILES[n].name) for n in datasets]
+        for epoch, (loss, rec) in enumerate(zip(trainer.history_["loss"], trainer.history_["val_recall"]), 1):
+            cur.log_metrics({"train_loss": loss, "val_recall@5": rec}, step=epoch)
+        cur.log_metrics({"best_val_recall@5": best_recall})
+        cur.add_artifact(Path(output_model_path), "checkpoint")
+        write_model_card(Path(output_model_path), cur, {"best_val_recall@5": best_recall})
     summary_path = Path(output_model_path).with_suffix(".train.json")
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
@@ -212,12 +223,15 @@ def main():
     p.add_argument("--device", default=None)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--max-samples-per-dataset", type=int, default=None)
+    p.add_argument("--oracle-dir", type=Path, default=ORACLE_DIR,
+                   help="Folder with {narrativeqa,hotpotqa}_train.json (e.g. data/oracle/t4096)")
     a = p.parse_args()
 
     from benchmarks.profiler import HardwareMonitor, wrap_result
     with HardwareMonitor(interval=0.5) as mon:
         summary = run(a.datasets, a.needle_samples, a.epochs, a.batch_size, a.lr,
-                      a.embedding_model, a.output, a.device, a.seed, a.max_samples_per_dataset)
+                      a.embedding_model, a.output, a.device, a.seed, a.max_samples_per_dataset,
+                      a.oracle_dir)
     out = Path(a.output).with_suffix(".hardware.json")
     with open(out, "w", encoding="utf-8") as f:
         json.dump(wrap_result({"best_val_recall@5": summary["best_val_recall@5"]}, mon), f, indent=2)
@@ -225,4 +239,6 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    from scripts.runlog import start_run
+    with start_run("train", "generalist", {"argv": sys.argv[1:]}):
+        main()

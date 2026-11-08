@@ -157,4 +157,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    from scripts.runlog import record_outputs, start_run
+    with start_run("download", "data", {"argv": sys.argv[1:]}) as _run:
+        main()
+        record_outputs(_run, MANIFEST, role='manifest')

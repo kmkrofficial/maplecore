@@ -155,8 +155,9 @@ def _print_table(name: str, summary: dict, metrics: List[str]) -> None:
 
 def run(model_path: Optional[Path] = None, embedding_model: str = BGE_MODEL_NAME,
         max_samples: Optional[int] = None, device: Optional[str] = None,
-        datasets: Optional[List[str]] = None) -> dict:
+        datasets: Optional[List[str]] = None, oracle_dir: Optional[Path] = None) -> dict:
     model_path = Path(model_path or MODEL_PATH)
+    heldout = {name: (Path(oracle_dir) / p.name if oracle_dir else p) for name, p in HELDOUT.items()}
     indexer = MapleIndexer(model_name=embedding_model, device=device)
     model = None
     if model_path.exists():
@@ -165,8 +166,9 @@ def run(model_path: Optional[Path] = None, embedding_model: str = BGE_MODEL_NAME
         logger.warning(f"No MAPLE model at {model_path}; evaluating baselines only.")
 
     results = {"config": {"model_path": str(model_path), "embedding_model": embedding_model,
-                          "k_values": K_VALUES, "max_samples": max_samples}, "datasets": {}}
-    for name, path in HELDOUT.items():
+                          "k_values": K_VALUES, "max_samples": max_samples,
+                          "oracle_dir": str(oracle_dir) if oracle_dir else "data/oracle"}, "datasets": {}}
+    for name, path in heldout.items():
         if datasets and name not in datasets:
             continue
         if not path.exists():
@@ -228,5 +230,11 @@ if __name__ == "__main__":
     p.add_argument("--embedding-model", default=BGE_MODEL_NAME)
     p.add_argument("--max-samples", type=int, default=None)
     p.add_argument("--device", default=None)
+    p.add_argument("--oracle-dir", type=Path, default=None,
+                   help="Folder with held-out oracle files (default data/oracle; e.g. data/oracle/t4096)")
     a = p.parse_args()
-    run(a.model, a.embedding_model, a.max_samples, a.device)
+    from scripts.runlog import flatten_metrics, record_outputs, start_run
+    with start_run("bench", "01_retrieval", vars(a)) as _run:
+        _run.log_metrics(flatten_metrics(run(a.model, a.embedding_model, a.max_samples, a.device, oracle_dir=a.oracle_dir)))
+        record_outputs(_run, RESULTS_DIR / 'retrieval_quality.json',
+                       RESULTS_DIR / 'retrieval_quality_per_item.json')

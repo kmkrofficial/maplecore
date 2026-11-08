@@ -5,7 +5,7 @@ Benchmark 06: E2E Generation Matrix
 Tests MAPLE retrieved context against actual LLM generation accuracy.
 Evaluates Gemini API models and (optionally) a local 4-bit Llama-3.
 
-Retrieval stress (docs/GAPS.md D3/D4): a SQuAD context is ~2 blocks and a
+Retrieval stress: a SQuAD context is ~2 blocks and a
 HotpotQA context ~10, so "top-5" used to hand the LLM (almost) everything.
 Each sample's context is now padded with other samples' contexts up to
 ``--haystack-chars`` (default 50,000 ~ 100 blocks), with the true context at a
@@ -507,4 +507,6 @@ def main():
     print("\nBENCHMARK 06 COMPLETE")
 
 if __name__ == "__main__":
-    main()
+    from scripts.runlog import start_run
+    with start_run("bench", "06_e2e", {"argv": sys.argv[1:]}):
+        main()

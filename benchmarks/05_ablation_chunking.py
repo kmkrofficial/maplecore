@@ -145,4 +145,7 @@ if __name__ == "__main__":
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default=None)
     a = p.parse_args()
-    run(a.chunk_sizes, a.budget_chars, a.max_questions, a.model, a.embedding_model, a.seed, a.device)
+    from scripts.runlog import flatten_metrics, record_outputs, start_run
+    with start_run("bench", "05_chunking", vars(a)) as _run:
+        _run.log_metrics(flatten_metrics(run(a.chunk_sizes, a.budget_chars, a.max_questions, a.model, a.embedding_model, a.seed, a.device)))
+        record_outputs(_run, RESULTS_DIR / 'ablation_chunking.json')

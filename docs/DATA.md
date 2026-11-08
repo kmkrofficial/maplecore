@@ -114,3 +114,35 @@ Writes the checkpoint plus `*.train.json` (data counts, history, seed) and
 
 All benchmarks write JSON (and PNG plots) to `benchmarks/results/`. See
 [METRICS.md](METRICS.md) for what each number means.
+
+## 5. Run registry (`runs/`)
+
+Every oracle, training, benchmark, aggregation and download run goes through
+`scripts/runlog.py`. Nothing lives only in a terminal. `runs/` is gitignored and
+never pruned.
+
+```
+runs/index.jsonl                      one line per finished run (append-only)
+runs/<YYYYMMDD-HHMMSS>_<kind>_<tag>/
+    config.json      arguments, argv, git commit/branch/dirty/diff hash,
+                     environment (platform, python, torch, CUDA, GPU, packages), data manifest
+    run.log          everything logged or printed during the run
+    metrics.jsonl    per-epoch / summary metrics (step, time, ...)
+    items/*.jsonl    per-question outputs (rankings, scores, predictions)
+    artifacts.json   path, role, bytes, sha256 of every recorded output
+    artifacts/       copies of small (< 50 MB) outputs
+    hardware.json    CPU / RAM / VRAM usage
+    summary.json     status (completed | failed), traceback, duration, final metrics
+runs/legacy_v1/      v0.2.0-era logs, results and checksums, imported once
+```
+
+A trained checkpoint `models/x.pth` gets `models/x.pth.card.json`: run id, config,
+encoder, seed, data files with checksums, validation metrics and git state.
+A run that crashes or is interrupted is still recorded, with `status: "failed"`.
+
+```bash
+python scripts/runlog.py list [--kind bench]
+python scripts/runlog.py show <run_id>
+python scripts/runlog.py import-legacy
+```
+

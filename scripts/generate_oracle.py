@@ -196,5 +196,8 @@ if __name__ == "__main__":
                    help="fast = SDPA + last-row capture, batched; eager = v0.2.0-style reference")
     p.add_argument("--batch-size", type=int, default=8, help="Prompts per forward pass (fast path)")
     a = p.parse_args()
-    run(a.split, a.max_samples, a.max_tokens, a.max_per_doc, a.teacher, a.resume, a.output,
-        a.attn_impl, a.batch_size)
+    from scripts.runlog import record_outputs, start_run
+    with start_run("oracle", f"nqa_{a.split}_{a.max_tokens}", vars(a)) as _run:
+        out_path = run(a.split, a.max_samples, a.max_tokens, a.max_per_doc, a.teacher, a.resume, a.output,
+                       a.attn_impl, a.batch_size)
+        record_outputs(_run, out_path, role='oracle')
