@@ -29,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from maplecore import MapleNet, MapleResidualNet, save_model
 from maplecore.listwise import ListwiseTrainer, QueryGroup
 from scripts.embedding_cache import DEFAULT_ENCODER, build_cache, cache_path_for, load_cache
-from scripts.oracle_common import load_oracle_samples
+from scripts.oracle_common import HeadStore, load_oracle_samples
 from scripts.runlog import current_run, write_model_card
 from scripts.targets import block_target
 
@@ -83,8 +83,11 @@ def add_distractors(groups: Sequence[QueryGroup], n: int, seed: int = 0) -> List
 
 
 def _oracle_groups(oracle: Path, cache_file: Path, encoder: str, target_source: str, temperature: float,
-                   skipped: Counter) -> List[QueryGroup]:
+                   skipped: Counter, heads: Optional[List[tuple]] = None) -> List[QueryGroup]:
     samples = load_oracle_samples(oracle)
+    store = HeadStore(oracle.with_suffix(".heads.pt")).load() if target_source == "heads" else None
+    if store is not None and not store.mass:
+        raise ValueError(f"{oracle.with_suffix('.heads.pt')} missing or empty; generate the oracle with --save-heads")
     cache = load_cache(cache_file, expected_encoder=encoder)
     ids = [str(s["id"]) for s in samples]
     block_ids = [[int(b["id"]) for b in s["blocks"]] for s in samples]
@@ -92,7 +95,13 @@ def _oracle_groups(oracle: Path, cache_file: Path, encoder: str, target_source: 
         raise ValueError(f"cache {cache_file} does not match {oracle} (different samples or blocks); rebuild it")
     groups = []
     for s, q, blocks in zip(samples, cache["q"], cache["blocks"]):
-        target = block_target(s, target_source, temperature)
+        head_mass = None
+        if store is not None:
+            if str(s["id"]) not in store.mass or store.block_order[str(s["id"])] != [int(b["id"]) for b in s["blocks"]]:
+                skipped["no_head_mass"] += 1
+                continue
+            head_mass = store.mass[str(s["id"])].float()
+        target = block_target(s, target_source, temperature, head_mass=head_mass, heads=heads)
         if target is None:
             skipped["degenerate_target"] += 1
             continue
@@ -121,6 +130,7 @@ def run(
     patience: int = 5,
     device: Optional[str] = None,
     distractors: int = 0,
+    heads_file: Optional[Path] = None,
 ) -> dict:
     """Train a scorer on oracle files and save it (plus ``<output stem>.train.json``). Returns the summary."""
     if model_kind not in MODEL_KINDS:
@@ -136,10 +146,15 @@ def run(
             logger.info(f"building missing cache {cache_file}")
             build_cache(oracle, cache_file, encoder=encoder, device=device)
 
+    heads = None
+    if target_source == "heads":
+        if heads_file is None:
+            raise ValueError("target_source='heads' needs heads_file (from scripts/select_heads.py)")
+        heads = [tuple(h) for h in json.loads(Path(heads_file).read_text(encoding="utf-8"))["heads"]]
     skipped: Counter = Counter()
     groups: List[QueryGroup] = []
     for oracle, cache_file in zip(train_oracles, cache_files):
-        groups.extend(_oracle_groups(oracle, cache_file, encoder, target_source, temperature, skipped))
+        groups.extend(_oracle_groups(oracle, cache_file, encoder, target_source, temperature, skipped, heads))
     if needle_samples > 0:
         from maplecore import MapleIndexer
         from scripts.train_generalist import build_needle_rows
@@ -169,6 +184,7 @@ def run(
         "encoder": encoder, "epochs": epochs, "seed": seed, "val_fraction": val_fraction,
         "needle_samples": needle_samples, "lr": lr, "tau": tau, "batch_groups": batch_groups,
         "patience": patience, "dim": dim, "distractors": distractors,
+        "heads_file": str(heads_file).replace("\\", "/") if heads_file else None,
         "groups": {"train": len(train), "val": len(val)},
         "skipped": dict(skipped),
         "parameters": sum(p.numel() for p in model.parameters()),
@@ -208,11 +224,13 @@ def main(argv: Optional[List[str]] = None) -> dict:
     p.add_argument("--patience", type=int, default=5)
     p.add_argument("--distractors", type=int, default=0,
                    help="Random blocks from other questions appended to every group (target mass 0)")
+    p.add_argument("--heads-file", type=Path, default=None,
+                   help="JSON from scripts/select_heads.py (required with --target-source heads)")
     p.add_argument("--device", default=None)
     a = p.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
     out = run(a.train_oracles, a.output, a.target_source, a.temperature, a.model_kind, a.encoder, a.epochs,
-              a.seed, a.val_fraction, a.needle_samples, None, a.lr, a.tau, a.batch_groups, a.patience, a.device, a.distractors)
+              a.seed, a.val_fraction, a.needle_samples, None, a.lr, a.tau, a.batch_groups, a.patience, a.device, a.distractors, a.heads_file)
     print(f"best {out['metric']}: {out['best_val'] * 100:.1f}%  ->  {a.output}")
     return out
 

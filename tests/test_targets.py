@@ -83,3 +83,20 @@ def test_calibrated_target_falls_back_and_counts():
 def test_calibrated_target_without_calibration_field_falls_back():
     s = _sample(blocks=[0, 1], all_layers={"0": .2, "1": .6})
     assert torch.allclose(block_target(s, "all_layers_calibrated"), torch.tensor([.25, .75]))
+
+
+def test_heads_target_uses_only_selected_heads():
+    mass = torch.zeros(2, 2, 3)
+    mass[1, 0] = torch.tensor([0.1, 0.8, 0.1])
+    mass[0, 1] = torch.tensor([0.9, 0.05, 0.05])
+    t = block_target(_sample(blocks=[0, 1, 2]), "heads", head_mass=mass, heads=[(1, 0)])
+    assert t.argmax() == 1 and torch.allclose(t, torch.tensor([0.1, 0.8, 0.1]))
+
+
+def test_heads_target_requires_inputs():
+    with pytest.raises(ValueError, match="head_mass"):
+        block_target(_sample(blocks=[0, 1]), "heads")
+
+
+def test_heads_target_zero_mass_is_degenerate():
+    assert block_target(_sample(blocks=[0, 1]), "heads", head_mass=torch.zeros(1, 1, 2), heads=[(0, 0)]) is None

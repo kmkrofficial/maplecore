@@ -135,3 +135,29 @@ def test_train_v2_records_distractors(tmp_path):
     run([oracle], tmp_path / "m.pt", encoder="fake-enc", epochs=1, cache_paths=[cache], device="cpu", distractors=6)
     summary = json.loads((tmp_path / "m.train.json").read_text(encoding="utf-8"))
     assert summary["distractors"] == 6
+
+
+# ------------------------------------------------------------ head-based targets (Task 9)
+
+def test_train_v2_with_head_targets(tmp_path):
+    n_samples, n_blocks = 24, 5
+    oracle = _write_oracle(tmp_path, n_samples=n_samples, blocks_per_sample=[n_blocks] * n_samples)
+    g = torch.Generator().manual_seed(0)
+    mass = {f"s{i}": torch.rand(3, 4, n_blocks, generator=g).half() for i in range(n_samples)}
+    order = {f"s{i}": list(range(n_blocks)) for i in range(n_samples)}
+    torch.save({"block_order": order, "mass": mass}, oracle.with_suffix(".heads.pt"))
+    heads_file = tmp_path / "heads.json"
+    heads_file.write_text(json.dumps({"teacher": "tiny", "k": 2, "heads": [[2, 1], [0, 3]]}), encoding="utf-8")
+    cache = build_cache(oracle, tmp_path / "c.pt", indexer=FakeIndexer(8, "fake-enc"))
+    run([oracle], tmp_path / "m.pt", target_source="heads", heads_file=heads_file, encoder="fake-enc", epochs=1,
+        cache_paths=[cache], device="cpu")
+    summary = json.loads((tmp_path / "m.train.json").read_text(encoding="utf-8"))
+    assert summary["target_source"] == "heads" and summary["heads_file"].endswith("heads.json")
+
+
+def test_head_targets_need_a_heads_file(tmp_path):
+    oracle = _write_oracle(tmp_path, n_samples=12, blocks_per_sample=[4] * 12)
+    cache = build_cache(oracle, tmp_path / "c.pt", indexer=FakeIndexer(8, "fake-enc"))
+    with pytest.raises(ValueError, match="heads_file"):
+        run([oracle], tmp_path / "m.pt", target_source="heads", encoder="fake-enc", epochs=1,
+            cache_paths=[cache], device="cpu")

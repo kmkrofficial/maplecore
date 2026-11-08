@@ -16,7 +16,8 @@ Sources:
                 content-free question (ICR-style calibration), floored at 0; falls back to
                 ``all_layers`` (and counts it in ``FALLBACKS``) when the calibration is missing or
                 removes all mass
-A later task adds ``heads``.
+    heads       mean attention mass of a selected set of (layer, head) pairs (``scripts/select_heads.py``);
+                needs ``head_mass`` [layers, heads, n_blocks] and ``heads``
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ from typing import Optional, Sequence, Tuple
 
 import torch
 
-SOURCES = ("last", "all_layers", "top5", "gold", "all_layers_calibrated")
+SOURCES = ("last", "all_layers", "top5", "gold", "all_layers_calibrated", "heads")
 # how often a source had to fall back to another one (reported by the training scripts)
 FALLBACKS: Counter = Counter()
 
@@ -76,6 +77,14 @@ def block_target(
                 return mass / mass.sum()
         FALLBACKS["all_layers_calibrated"] += 1
         return _mass_target(sample, "attention_scores_all_layers", temperature)
+    if source == "heads":
+        if head_mass is None or heads is None:
+            raise ValueError("source 'heads' needs head_mass and heads")
+        chosen = torch.stack([head_mass[l, h] for l, h in heads]).float().mean(dim=0)
+        if chosen.max() <= 0:
+            return None
+        chosen = chosen.clamp(min=0) ** (1.0 / temperature)
+        return chosen / chosen.sum()
     if source == "top5":
         return _uniform_target(sample, sample.get("top_5_block_ids", []))
     if source == "gold":
