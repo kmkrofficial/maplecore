@@ -8,16 +8,18 @@ for Memory-Aware Predictive Loading.
 from __future__ import annotations
 
 import logging
+import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Union
 
+import numpy as np
 import torch
 
 from .core import MapleNet
-from .indexer import Index
-from .utils import _compute_entropy, _cosine_similarity
+from .indexer import Index, compute_chapter_embeddings
+from .utils import _compute_entropy, resolve_device
 
 logger = logging.getLogger(__name__)
 
@@ -36,114 +38,144 @@ class SearchResult:
     scores: List[float]
     strategy_used: str
     latency_ms: float
-    metadata: dict
-    
+    metadata: dict = field(default_factory=dict)
+
     @property
     def num_results(self) -> int:
         return len(self.block_ids)
 
 
+def _chapter_embeddings(index, chapter_size: int) -> torch.Tensor:
+    """Use the index's cached chapter embeddings when available."""
+    if hasattr(index, "chapter_embeddings"):
+        return index.chapter_embeddings(chapter_size)
+    return compute_chapter_embeddings(index.embeddings, chapter_size)
+
+
 class MapleScanner:
     """
     MAPLE search engine.
-    
+
     Supports multiple search strategies:
     - Linear: Score all blocks
     - Hierarchical: Chapter-level filtering then block-level
-    - Adaptive: Entropy-aware with dynamic K and fallback
+    - Adaptive: Hierarchical with a confidence-gated wide fallback and
+      dynamic K based on cumulative score mass
     """
-    
+
     def __init__(
         self,
         model: Union[MapleNet, "MapleONNXRunner"],
-        device: str = "cuda",
+        device: Optional[str] = None,
         confidence_threshold: float = 0.15,
         mass_target: float = 0.80,
         max_blocks: int = 20,
-        chapter_size: int = 100
+        chapter_size: int = 100,
+        fast_chapters: int = 5,
+        fallback_chapters: int = 50,
+        entropy_threshold: Optional[float] = None,
+        score_batch_size: int = 32768,
     ) -> None:
         """
         Initialize the scanner.
-        
+
         Args:
-            model: MapleNet model
-            device: Compute device
-            confidence_threshold: Min confidence before fallback
-            mass_target: Target attention mass for adaptive K
-            max_blocks: Maximum blocks to return
-            chapter_size: Blocks per chapter for hierarchical search
+            model: MapleNet model or MapleONNXRunner
+            device: Compute device (None = auto-detect)
+            confidence_threshold: If the best chapter score is below this,
+                adaptive search widens to ``fallback_chapters``
+            mass_target: Target cumulative score mass for adaptive K
+            max_blocks: Maximum blocks returned by adaptive search
+            chapter_size: Blocks per chapter for hierarchical/adaptive search
+            fast_chapters: Chapters scanned on the adaptive fast path (and by
+                hierarchical search)
+            fallback_chapters: Chapters scanned on the adaptive fallback path
+            entropy_threshold: Optional. If set, adaptive search also falls
+                back when the *normalised* chapter-score entropy (0..1) is
+                above this value, i.e. the chapter scores are flat.
+            score_batch_size: Blocks scored per forward pass
         """
         self.model = model
-        self.device = device
-        
+        self.device = resolve_device(device)
+
         # Only PyTorch models need to be moved to device and set to eval
         if hasattr(self.model, "to"):
-            self.model = self.model.to(device)
+            self.model = self.model.to(self.device)
         if hasattr(self.model, "eval"):
             self.model.eval()
-        
+
         self.confidence_threshold = confidence_threshold
         self.mass_target = mass_target
         self.max_blocks = max_blocks
         self.chapter_size = chapter_size
-        
-        logger.info(f"MapleScanner initialized (device={device})")
-    
+        self.fast_chapters = fast_chapters
+        self.fallback_chapters = fallback_chapters
+        self.entropy_threshold = entropy_threshold
+        self.score_batch_size = score_batch_size
+
+        logger.info(f"MapleScanner initialized (device={self.device})")
+
+    # ------------------------------------------------------------------
+    # Scoring
+    # ------------------------------------------------------------------
+
     def _score_blocks(
-        self, 
-        query_emb: torch.Tensor, 
+        self,
+        query_emb: torch.Tensor,
         block_embs: torch.Tensor,
-        batch_size: int = 32768
+        batch_size: Optional[int] = None
     ) -> torch.Tensor:
         """
-        Score all blocks using MAPLE model in memory-safe batches.
-        
+        Score blocks with the MAPLE model in memory-safe batches.
+
         Args:
             query_emb: Query embedding [dim]
             block_embs: Block embeddings [N, dim]
-            batch_size: Chunks of blocks to process on GPU at once
-            
+            batch_size: Blocks per forward pass
+
         Returns:
-            Scores tensor [N] on CPU
+            Sigmoid scores tensor [N] on CPU
         """
-        query_emb = query_emb.to(self.device).unsqueeze(0)
+        batch_size = batch_size or self.score_batch_size
         num_blocks = block_embs.shape[0]
-        
+        if num_blocks == 0:
+            return torch.empty(0)
+
+        is_onnx = hasattr(self.model, "predict")
+        query_emb = query_emb.to(self.device).float().unsqueeze(0)
+
         all_scores = []
-        
         with torch.no_grad():
             for i in range(0, num_blocks, batch_size):
-                # Transfer only this batch to GPU
-                batch_embs = block_embs[i:i + batch_size].to(self.device)
-                
-                # Expand query to match this batch's size
+                batch_embs = block_embs[i:i + batch_size].to(self.device).float()
                 query_expanded = query_emb.expand(batch_embs.shape[0], -1)
-                
-                # Compute
                 combined = torch.cat([query_expanded, batch_embs], dim=1)
-                
-                # Check if model is an ONNX Runner (duck typing)
-                if hasattr(self.model, "predict"):
-                    # Convert to numpy, run prediction, convert back to tensor
-                    combined_np = combined.cpu().numpy()
-                    scores_np = self.model.predict(combined_np)
-                    # Convert back to tensor. Our ONNX predict already applied sigmoid.
-                    scores = torch.from_numpy(scores_np).float().to(self.device)
+
+                if is_onnx:
+                    scores_np = self.model.predict(combined.cpu().numpy())
+                    scores = torch.from_numpy(np.asarray(scores_np, dtype=np.float32).reshape(-1))
                 else:
-                    # Native PyTorch path
-                    logits = self.model(combined)
-                    scores = torch.sigmoid(logits)
-                
-                # Move results securely to CPU immediately
-                all_scores.append(scores.cpu())
-                
-                # Aggressive VRAM cleanup
-                del batch_embs, query_expanded, combined, logits, scores
-                if self.device == "cuda":
-                    torch.cuda.empty_cache()
-                    
+                    scores = torch.sigmoid(self.model(combined).reshape(-1)).float().cpu()
+
+                all_scores.append(scores)
+
         return torch.cat(all_scores, dim=0)
-    
+
+    def _gather_candidates(self, chap_ids: List[int], num_blocks: int) -> List[int]:
+        candidate_indices: List[int] = []
+        for chap_id in chap_ids:
+            start_idx = chap_id * self.chapter_size
+            end_idx = min(start_idx + self.chapter_size, num_blocks)
+            candidate_indices.extend(range(start_idx, end_idx))
+        return candidate_indices
+
+    def _num_chapters(self, num_blocks: int) -> int:
+        return math.ceil(num_blocks / self.chapter_size)
+
+    # ------------------------------------------------------------------
+    # Strategies
+    # ------------------------------------------------------------------
+
     def search_linear(
         self,
         query_emb: torch.Tensor,
@@ -152,90 +184,54 @@ class MapleScanner:
     ) -> SearchResult:
         """
         Linear search: Score all blocks and return top-k.
-        
-        Args:
-            query_emb: Query embedding
-            index: Document index
-            k: Number of results
-            
-        Returns:
-            SearchResult
         """
         start = time.perf_counter()
-        
+
         scores = self._score_blocks(query_emb, index.embeddings)
         top_scores, top_ids = torch.topk(scores, min(k, len(scores)))
-        
+
         latency = (time.perf_counter() - start) * 1000
-        
+
         return SearchResult(
-            block_ids=top_ids.cpu().tolist(),
-            scores=top_scores.cpu().tolist(),
+            block_ids=top_ids.tolist(),
+            scores=top_scores.tolist(),
             strategy_used="linear",
             latency_ms=latency,
             metadata={"blocks_scanned": index.num_blocks}
         )
-    
+
     def search_hierarchical(
         self,
         query_emb: torch.Tensor,
         index: Index,
         k: int = 5,
-        top_chapters: int = 5
+        top_chapters: Optional[int] = None
     ) -> SearchResult:
         """
-        Hierarchical search: Filter by chapter, then by block.
-        
-        Args:
-            query_emb: Query embedding
-            index: Document index
-            k: Number of results
-            top_chapters: Number of chapters to consider
-            
-        Returns:
-            SearchResult
+        Hierarchical search: score chapters, then blocks within the best ones.
         """
         start = time.perf_counter()
-        
-        # Build chapter embeddings
-        num_chapters = index.num_blocks // self.chapter_size
-        if num_chapters == 0:
-            return self.search_linear(query_emb, index, k)
-        
-        chapter_embs = []
-        for i in range(num_chapters):
-            start_idx = i * self.chapter_size
-            end_idx = start_idx + self.chapter_size
-            chapter_emb = index.embeddings[start_idx:end_idx].mean(dim=0)
-            chapter_embs.append(chapter_emb)
-        
-        chapter_embs = torch.stack(chapter_embs)
-        
-        # Score chapters
-        chapter_scores = self._score_blocks(query_emb, chapter_embs)
+        top_chapters = top_chapters or self.fast_chapters
+
+        num_chapters = self._num_chapters(index.num_blocks)
+        if num_chapters <= top_chapters:
+            result = self.search_linear(query_emb, index, k)
+            result.metadata["fallback_reason"] = "index smaller than chapter budget"
+            return result
+
+        chapter_scores = self._score_blocks(query_emb, _chapter_embeddings(index, self.chapter_size))
         _, top_chap_ids = torch.topk(chapter_scores, min(top_chapters, num_chapters))
-        
-        # Gather blocks from top chapters
-        candidate_indices = []
-        for chap_id in top_chap_ids.tolist():
-            start_idx = chap_id * self.chapter_size
-            end_idx = start_idx + self.chapter_size
-            candidate_indices.extend(range(start_idx, min(end_idx, index.num_blocks)))
-        
-        candidate_embs = index.embeddings[candidate_indices]
-        
-        # Score candidates
-        candidate_scores = self._score_blocks(query_emb, candidate_embs)
+
+        candidate_indices = self._gather_candidates(top_chap_ids.tolist(), index.num_blocks)
+        candidate_scores = self._score_blocks(query_emb, index.embeddings[candidate_indices])
         top_scores, top_relative = torch.topk(candidate_scores, min(k, len(candidate_scores)))
-        
-        # Map back to global indices
         top_ids = [candidate_indices[i] for i in top_relative.tolist()]
-        
+
         latency = (time.perf_counter() - start) * 1000
-        
+
         return SearchResult(
             block_ids=top_ids,
-            scores=top_scores.cpu().tolist(),
+            scores=top_scores.tolist(),
             strategy_used="hierarchical",
             latency_ms=latency,
             metadata={
@@ -244,7 +240,7 @@ class MapleScanner:
                 "top_chapters": top_chap_ids.tolist()
             }
         )
-    
+
     def search_adaptive(
         self,
         query_emb: torch.Tensor,
@@ -252,123 +248,69 @@ class MapleScanner:
         k: int = 5
     ) -> SearchResult:
         """
-        Adaptive search: Hierarchical scouting with entropy-based confidence.
-        
+        Adaptive search: hierarchical scouting with confidence-gated fallback.
+
         Algorithm:
-        1. Scout: Score chapters (coarse-grained) -> O(N/C)
-        2. Check: Compute metrics (entropy, confidence) on chapter scores
-        3. Select: 
-           - High confidence -> Top-K chapters (Fast Path)
-           - Low confidence -> Top-50 chapters (Wide Fallback)
-        4. Score: Score blocks within selected chapters -> O(1)
-        
-        Args:
-            query_emb: Query embedding
-            index: Document index
-            k: Minimum number of results
-            
-        Returns:
-            SearchResult
+        1. Scout: score all chapter embeddings (coarse) -> O(N / C)
+        2. Check: max chapter score (and optionally normalised entropy)
+        3. Select: confident -> ``fast_chapters``; otherwise ``fallback_chapters``
+        4. Score blocks inside the selected chapters and keep blocks until
+           ``mass_target`` of the candidate score mass is covered
+           (at least ``k``, at most ``max(k, max_blocks)``).
         """
         start = time.perf_counter()
-        
-        query_emb = query_emb.to(self.device)
-        # Note: We do NOT move all block_embs to device here anymore,
-        # to avoid O(N) memory transfer if index is large and on CPU.
-        
-        # --- Phase 1: Chapter Scouting ---
-        num_chapters = index.num_blocks // self.chapter_size
-        if num_chapters == 0:
-            return self.search_linear(query_emb, index, k)
-            
-        # Build/Get chapter embeddings (mean pooling)
-        # Optimization: In production, these should be pre-computed.
-        # Here we compute on-the-fly but only move 1/C tensors to GPU.
-        chapter_embs = []
-        for i in range(num_chapters):
-            start_idx = i * self.chapter_size
-            end_idx = start_idx + self.chapter_size
-            # tensordot/mean on CPU is fast enough for 10M/100 = 100k vectors?
-            # Or move batch to GPU? 
-            # For simplicity & memory safety, compute on device where embeddings are.
-            chunk = index.embeddings[start_idx:end_idx]
-            chapter_emb = chunk.mean(dim=0)
-            chapter_embs.append(chapter_emb)
-            
-        chapter_embs = torch.stack(chapter_embs).to(self.device)
-        
-        # Score chapters
-        chapter_scores = self._score_blocks(query_emb, chapter_embs)
-        
-        # --- Phase 2: Entropy Check ---
-        # Normalize to probability distribution
-        probs = chapter_scores / chapter_scores.sum()
-        entropy = _compute_entropy(probs)
-        max_conf = chapter_scores.max().item()
-        
-        # --- Phase 3: Selection ---
-        if max_conf < self.confidence_threshold:
-            # Low confidence: Widen search window significantly
-            # Still avoids full linear scan (which might be 10M blocks)
-            top_n_chapters = 50  # Scan top 50 chapters (~5000 blocks)
-            action = "Fallback (Wide Search)"
-        else:
-            # High confidence: Focused search
-            top_n_chapters = 5   # Scan top 5 chapters (~500 blocks)
-            action = "Fast Path"
 
-        # Instrumentation
-        logger.debug(f"Adaptive: {action} (Entropy {entropy:.2f})")
-        
-        # Select top chapters
-        _, top_chap_ids = torch.topk(chapter_scores, min(top_n_chapters, num_chapters))
-        
-        # Cleanup intermediate tensors to prevent VRAM spikes
-        del chapter_embs, chapter_scores
-        # torch.cuda.empty_cache() # Optional, but can slow down loop
-        
-        # Gather candidate blocks
-        candidate_indices = []
-        for chap_id in top_chap_ids.tolist():
-            start_idx = chap_id * self.chapter_size
-            end_idx = start_idx + self.chapter_size
-            candidate_indices.extend(range(start_idx, min(end_idx, index.num_blocks)))
-            
-        # Get candidate embeddings (keep on CPU; _score_blocks handles batch transfer)
-        candidate_embs = index.embeddings[candidate_indices]
-        
-        # --- Phase 4: Block Scoring & Result Selection ---
-        block_scores = self._score_blocks(query_emb, candidate_embs)
-        
-        # Apply Mass Target Logic on Candidates
-        # (Same logic as original adaptive, but on subset)
-        probs_blocks = block_scores / block_scores.sum()
-        
-        sorted_indices_local = torch.argsort(block_scores, descending=True)
-        sorted_probs = probs_blocks[sorted_indices_local]
-        
+        num_chapters = self._num_chapters(index.num_blocks)
+
+        if num_chapters <= self.fast_chapters:
+            # Small index: the fast path would scan everything anyway.
+            entropy = 0.0
+            norm_entropy = 0.0
+            max_conf = float("nan")
+            action = "Linear (small index)"
+            candidate_indices = list(range(index.num_blocks))
+        else:
+            chapter_scores = self._score_blocks(
+                query_emb, _chapter_embeddings(index, self.chapter_size)
+            )
+            probs = chapter_scores / chapter_scores.sum().clamp(min=1e-12)
+            entropy = _compute_entropy(probs)
+            norm_entropy = entropy / math.log(num_chapters) if num_chapters > 1 else 0.0
+            max_conf = chapter_scores.max().item()
+
+            low_conf = max_conf < self.confidence_threshold
+            flat = self.entropy_threshold is not None and norm_entropy > self.entropy_threshold
+            if low_conf or flat:
+                top_n_chapters = self.fallback_chapters
+                action = "Fallback (Wide Search)"
+            else:
+                top_n_chapters = self.fast_chapters
+                action = "Fast Path"
+
+            _, top_chap_ids = torch.topk(chapter_scores, min(top_n_chapters, num_chapters))
+            candidate_indices = self._gather_candidates(top_chap_ids.tolist(), index.num_blocks)
+
+        logger.debug(f"Adaptive: {action} (entropy={entropy:.3f}, max_conf={max_conf:.3f})")
+
+        block_scores = self._score_blocks(query_emb, index.embeddings[candidate_indices])
+        order = torch.argsort(block_scores, descending=True)
+        probs_blocks = block_scores / block_scores.sum().clamp(min=1e-12)
+
+        limit = max(k, self.max_blocks)
+        selected_ids: List[int] = []
+        selected_scores: List[float] = []
         cumulative_mass = 0.0
-        selected_ids = []
-        selected_scores = []
-        
-        for i, idx in enumerate(sorted_indices_local):
-            if cumulative_mass >= self.mass_target or len(selected_ids) >= self.max_blocks:
+        for idx in order.tolist():
+            if len(selected_ids) >= limit:
                 break
-            
-            global_idx = candidate_indices[idx.item()]
-            selected_ids.append(global_idx)
+            if len(selected_ids) >= k and cumulative_mass >= self.mass_target:
+                break
+            selected_ids.append(candidate_indices[idx])
             selected_scores.append(block_scores[idx].item())
-            cumulative_mass += sorted_probs[i].item()
-            
-        # Ensure at least k results
-        while len(selected_ids) < k and len(selected_ids) < len(candidate_indices):
-            next_local_idx = sorted_indices_local[len(selected_ids)].item()
-            global_idx = candidate_indices[next_local_idx]
-            selected_ids.append(global_idx)
-            selected_scores.append(block_scores[next_local_idx].item())
-            
+            cumulative_mass += probs_blocks[idx].item()
+
         latency = (time.perf_counter() - start) * 1000
-        
+
         return SearchResult(
             block_ids=selected_ids,
             scores=selected_scores,
@@ -376,13 +318,14 @@ class MapleScanner:
             latency_ms=latency,
             metadata={
                 "entropy": entropy,
+                "normalized_entropy": norm_entropy,
                 "max_confidence": max_conf,
                 "action": action,
                 "chapters_scanned": num_chapters,
                 "blocks_scored": len(candidate_indices)
             }
         )
-    
+
     def search(
         self,
         query_emb: torch.Tensor,
@@ -391,19 +334,13 @@ class MapleScanner:
         strategy: str = "adaptive"
     ) -> SearchResult:
         """
-        Search the index using specified strategy.
-        
-        Args:
-            query_emb: Query embedding
-            index: Document index
-            k: Number of results
-            strategy: Search strategy ('linear', 'hierarchical', 'adaptive')
-            
-        Returns:
-            SearchResult
+        Search the index using the specified strategy
+        ('linear', 'hierarchical', 'adaptive').
         """
+        if isinstance(strategy, SearchStrategy):
+            strategy = strategy.value
         strategy = strategy.lower()
-        
+
         if strategy == "linear":
             return self.search_linear(query_emb, index, k)
         elif strategy == "hierarchical":

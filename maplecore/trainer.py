@@ -6,7 +6,9 @@ Logic for training the MapleNet model from oracle data.
 
 from __future__ import annotations
 
+import copy
 import logging
+import random
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
@@ -30,7 +32,9 @@ class _MapleDataset(Dataset):
         Initialize dataset.
         
         Args:
-            data: List of dicts with 'query_emb', 'block_emb', 'label', 'question', 'block_id'
+            data: List of dicts with 'query_emb', 'block_emb', 'label', 'question',
+                'block_id' and optionally 'group' (the unit used for the train/val
+                split and for per-query Recall@K; defaults to 'question').
         """
         self.data = data
     
@@ -41,7 +45,7 @@ class _MapleDataset(Dataset):
         item = self.data[idx]
         combined = torch.cat([item["query_emb"], item["block_emb"]], dim=0)
         label = torch.tensor(item["label"], dtype=torch.float32)
-        return combined, label, item["question"], item["block_id"]
+        return combined, label, item.get("group", item["question"]), item["block_id"]
 
 
 def _collate_fn(batch):
@@ -61,7 +65,8 @@ class MapleTrainer:
         input_dim: int = 768,
         hidden_dim: int = 128,
         dropout: float = 0.3,
-        device: str = "cuda"
+        device: Optional[str] = None,
+        seed: Optional[int] = 42
     ) -> None:
         """
         Initialize trainer.
@@ -70,12 +75,15 @@ class MapleTrainer:
             input_dim: Input dimension (query + block)
             hidden_dim: Hidden layer dimension
             dropout: Dropout rate
-            device: Training device
+            device: Training device (None = auto-detect)
+            seed: Random seed for splits, shuffling and init (None = no seeding)
         """
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.dropout = dropout
-        self.device = torch.device(device)
+        from .utils import resolve_device
+        self.device = torch.device(resolve_device(device))
+        self.seed = seed
         self.history_ = {"epoch": [], "loss": [], "val_recall": []}
         
         logger.info(f"MapleTrainer initialized (device={device})")
@@ -145,15 +153,22 @@ class MapleTrainer:
         Returns:
             Tuple of (trained model, best recall score)
         """
-        # Split by question
-        questions = list(set(ex["question"] for ex in training_data))
-        np.random.shuffle(questions)
+        if self.seed is not None:
+            random.seed(self.seed)
+            np.random.seed(self.seed)
+            torch.manual_seed(self.seed)
+
+        # Split by group/question (sorted first so the split is reproducible)
+        key = lambda ex: ex.get("group", ex["question"])
+        questions = sorted(set(key(ex) for ex in training_data))
+        rng = np.random.default_rng(self.seed)
+        rng.shuffle(questions)
         split_idx = int(len(questions) * (1 - val_split))
         train_q = set(questions[:split_idx])
         val_q = set(questions[split_idx:])
         
-        train_data = [ex for ex in training_data if ex["question"] in train_q]
-        val_data = [ex for ex in training_data if ex["question"] in val_q]
+        train_data = [ex for ex in training_data if key(ex) in train_q]
+        val_data = [ex for ex in training_data if key(ex) in val_q]
         
         logger.info(f"Train: {len(train_data)} examples, Val: {len(val_data)} examples")
         
@@ -204,7 +219,8 @@ class MapleTrainer:
             
             if val_recall > best_recall:
                 best_recall = val_recall
-                best_state = model.state_dict().copy()
+                # deepcopy: state_dict() returns live references to the weights
+                best_state = copy.deepcopy(model.state_dict())
             
             logger.info(
                 f"Epoch {epoch+1:2d}/{epochs} | "

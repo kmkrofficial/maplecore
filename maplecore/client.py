@@ -26,7 +26,7 @@ class Maple:
     context retrieval using Memory-Aware Predictive Loading.
     
     Example:
-        >>> client = Maple(model_path="maple.pth")
+        >>> client = Maple(model_path="models/maple_generalist.pth")
         >>> client.index_file("document.txt")
         >>> results = client.query("What is the main topic?")
         >>> for block_id in results.block_ids[:5]:

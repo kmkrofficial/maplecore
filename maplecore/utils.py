@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 import sys
-from typing import Optional
+from typing import Optional, Union
 
 import torch
 
@@ -37,16 +37,35 @@ def setup_logging(
 def get_device(prefer_cuda: bool = True) -> torch.device:
     """
     Get the best available device.
-    
+
     Args:
         prefer_cuda: Whether to prefer CUDA if available
-        
+
     Returns:
         torch.device object
     """
     if prefer_cuda and torch.cuda.is_available():
         return torch.device("cuda")
     return torch.device("cpu")
+
+
+def resolve_device(device: Optional[Union[str, torch.device]] = None) -> str:
+    """
+    Normalise a device argument to a string.
+
+    ``None`` (or ``"auto"``) picks CUDA when available, otherwise CPU.
+    Requesting ``"cuda"`` on a machine without CUDA falls back to CPU
+    with a warning instead of crashing.
+    """
+    if device is None or str(device) == "auto":
+        return str(get_device())
+    device = str(device)
+    if device.startswith("cuda") and not torch.cuda.is_available():
+        logging.getLogger(__name__).warning(
+            f"Device '{device}' requested but CUDA is unavailable; using CPU."
+        )
+        return "cpu"
+    return device
 
 
 def _ensure_utf8() -> None:

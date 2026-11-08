@@ -2,7 +2,14 @@
 Context Management for MAPLE Orchestration
 """
 
+import hashlib
 from typing import List, Dict, Set
+
+
+def _chunk_hash(chunk: str) -> str:
+    """Stable content hash (Python's hash() is salted per process)."""
+    return hashlib.sha256(chunk.encode("utf-8")).hexdigest()
+
 
 class ContextSynthesizer:
     def __init__(self, max_tokens: int = 4000, chars_per_token: float = 4.0):
@@ -17,7 +24,7 @@ class ContextSynthesizer:
         # Store chunks as a list of dicts to maintain order and metadata
         # e.g., [{"text": "...", "id": 123, "hop": 0}, ...]
         self.context_chunks: List[Dict] = []
-        self.seen_hashes: Set[int] = set()
+        self.seen_hashes: Set[str] = set()
 
     def add_chunks(self, chunks: List[str], current_hop: int = 0) -> int:
         """
@@ -26,7 +33,7 @@ class ContextSynthesizer:
         """
         added = 0
         for chunk in chunks:
-            chunk_hash = hash(chunk)
+            chunk_hash = _chunk_hash(chunk)
             if chunk_hash not in self.seen_hashes:
                 self.seen_hashes.add(chunk_hash)
                 self.context_chunks.append({
@@ -53,9 +60,10 @@ class ContextSynthesizer:
             
         # If we need to evict, we remove from the beginning (oldest chunks)
         # In a more advanced implementation, we might score relevance.
-        while current_chars > self.max_chars and self.context_chunks:
+        # Evicted hashes stay in seen_hashes so the orchestrator does not
+        # re-add (and loop on) chunks it already showed the LLM.
+        while current_chars > self.max_chars and len(self.context_chunks) > 1:
             evicted = self.context_chunks.pop(0)
-            self.seen_hashes.remove(hash(evicted["text"]))
             current_chars -= len(evicted["text"])
 
     def get_context_string(self) -> str:

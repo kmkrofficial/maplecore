@@ -85,18 +85,23 @@ class MapleNet(nn.Module):
     def export_to_onnx(
         self, 
         save_path: Union[str, Path], 
-        dummy_input_shape: tuple = (1, 768)
+        dummy_input_shape: Optional[tuple] = None
     ) -> None:
         """
         Export the MAPLE model to ONNX format for production inference.
         
         Args:
             save_path: Path to save the .onnx file
-            dummy_input_shape: Shape of the input tensor, defaults to [1, 768] 
-                               based on concatenated (query + block) embeddings
+            dummy_input_shape: Shape of the input tensor. Defaults to
+                               (1, self.input_dim), i.e. concatenated
+                               (query + block) embeddings.
         """
         save_path = Path(save_path)
         save_path.parent.mkdir(parents=True, exist_ok=True)
+        if dummy_input_shape is None:
+            dummy_input_shape = (1, self.input_dim)
+        was_training = self.training
+        self.eval()
         
         # We match dtype with model weight dtype
         dummy_input = torch.randn(dummy_input_shape, device=next(self.parameters()).device, dtype=next(self.parameters()).dtype)
@@ -115,13 +120,15 @@ class MapleNet(nn.Module):
                 "output": {0: "batch_size"}
             }
         )
+        if was_training:
+            self.train()
         logger.info(f"ONNX Model exported successfully to {save_path}")
     
     @classmethod
     def load(
         cls, 
         path: Union[str, Path], 
-        device: str = "cuda",
+        device: Optional[str] = None,
         **kwargs
     ) -> "MapleNet":
         """
@@ -129,19 +136,25 @@ class MapleNet(nn.Module):
         
         Args:
             path: Path to weights file (.pth)
-            device: Device to load model to
+            device: Device to load model to (None = auto-detect)
             **kwargs: Additional arguments for model initialization
             
         Returns:
             Loaded MapleNet model
         """
+        from .utils import resolve_device
+        device = resolve_device(device)
         state_dict = torch.load(path, map_location=device, weights_only=True)
-        # Dynamically infer the input dimension from the saved state_dict
+        # Infer architecture from the saved weights so callers cannot mismatch it
         if "fc1.weight" in state_dict:
-            inferred_input_dim = state_dict["fc1.weight"].shape[1]
-            if "input_dim" not in kwargs or kwargs["input_dim"] != inferred_input_dim:
-                logger.info(f"Inferring input_dim={inferred_input_dim} from saved model weights.")
-                kwargs["input_dim"] = inferred_input_dim
+            hidden, inferred_input_dim = state_dict["fc1.weight"].shape
+            if kwargs.get("input_dim", inferred_input_dim) != inferred_input_dim:
+                logger.warning(
+                    f"input_dim={kwargs['input_dim']} requested but checkpoint has "
+                    f"input_dim={inferred_input_dim} (encoder mismatch?). Using the checkpoint's."
+                )
+            kwargs["input_dim"] = int(inferred_input_dim)
+            kwargs["hidden_dim"] = int(hidden)
 
         model = cls(**kwargs)
         model.load_state_dict(state_dict)

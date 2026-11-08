@@ -17,7 +17,8 @@ class RecursiveOrchestrator:
         Args:
             indexer: Instance of MapleIndexer.
             scanner: Instance of MapleScanner.
-            max_hops: Maximum number of recursive LLM searches.
+            max_hops: Maximum number of follow-up searches. The LLM is called
+                at most ``max_hops + 1`` times, plus one final fallback call.
         """
         self.indexer = indexer
         self.scanner = scanner
@@ -52,7 +53,7 @@ class RecursiveOrchestrator:
         synthesizer.add_chunks(initial_chunks, current_hop=0)
         
         hops = 0
-        while hops <= self.max_hops:
+        while True:
             context_str = synthesizer.get_context_string()
             prompt = f"{ORCHESTRATION_SYSTEM_PROMPT}\n\nContext:\n{context_str}\n\nQuestion: {question}"
             
@@ -65,6 +66,9 @@ class RecursiveOrchestrator:
                 # LLM believes it possesses the answer natively
                 return response_text.strip(), hops
                 
+            if hops >= self.max_hops:
+                break
+
             sub_query = match.group(1)
             
             # Execute secondary MAPLE vector search against the existing context

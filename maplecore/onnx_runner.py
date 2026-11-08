@@ -50,9 +50,17 @@ class MapleONNXRunner:
         Returns:
             Sigmoid output scoring array [batch_size]
         """
+        x = np.ascontiguousarray(x, dtype=np.float32)
+        if x.ndim == 1:
+            x = x[None, :]
+
         # ONNX execution
         logits = self.session.run(None, {self.input_name: x})[0]
-        
-        # Apply Sigmoid locally: 1 / (1 + exp(-x))
-        scores = 1 / (1 + np.exp(-logits))
-        return scores.squeeze()
+
+        # Numerically stable sigmoid; always return shape [batch_size]
+        logits = np.asarray(logits, dtype=np.float32).reshape(-1)
+        return np.where(
+            logits >= 0,
+            1.0 / (1.0 + np.exp(-logits)),
+            np.exp(logits) / (1.0 + np.exp(logits)),
+        ).astype(np.float32)
