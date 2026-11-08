@@ -19,7 +19,7 @@ mkdir -p logs models "$R"
 stamp() { date +%H:%M:%S; }
 collect() {  # move the given result files into $R/$1/
   local dest="$R/$1"; shift; mkdir -p "$dest"
-  for f in "$@"; do for g in $R/$f; do [ -e "$g" ] && mv "$g" "$dest/"; done; done
+  for f in "$@"; do for g in $R/$f; do if [ -e "$g" ]; then mv "$g" "$dest/"; fi; done; done
 }
 oracle_dir() { [ "$1" = 4096 ] && echo data/oracle/t4096 || echo data/oracle; }
 

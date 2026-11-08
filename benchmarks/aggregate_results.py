@@ -14,6 +14,7 @@ writes benchmarks/results/SUMMARY.md and SUMMARY.json.
 
 from __future__ import annotations
 
+import argparse
 import json
 import re
 import sys
@@ -23,6 +24,7 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from benchmarks import metrics as M
 from benchmarks.config import RESULTS_DIR
 
 METHODS = ["random", "lead", "bm25", "dense", "maple", "oracle_last", "oracle_all_layers"]
@@ -165,6 +167,90 @@ def chunk_tables(runs) -> list[str]:
     return lines
 
 
+
+# ---------------------------------------------------------------- gate variants
+
+VARIANT_METRICS = ["evidence_recall@5", "all_evidence@5", "answer_in@5", "oracle_recall@5"]
+_BASELINE_ROWS = ["bm25", "dense", "oracle_last", "oracle_all_layers"]
+_RUN_RE = re.compile(r"(?:(?P<variant>[A-Za-z0-9]+)_)?b(?P<budget>\d+)_s(?P<seed>\d+)")
+
+
+def _cell(vals: list, half: float) -> str:
+    mean, std = float(np.mean(vals)), float(np.std(vals))
+    return f"{_pct(mean)}" + (f" ± {_pct(std)}" if len(vals) > 1 else "") + f" [±{_pct(half)}]"
+
+
+def variant_tables(root: Path, metrics=VARIANT_METRICS) -> tuple[list[str], dict]:
+    """One table per (teacher budget, dataset): baseline rows plus a row per MAPLE variant.
+
+    Looks for ``<root>/<variant>_b<budget>_s<seed>/retrieval_quality.json`` (v1 folders without a
+    variant prefix count as variant ``v1``). Cells are the mean over seeds of per-seed means,
+    ``± std over seeds``, and ``[± 95% bootstrap CI half-width]`` of the first seed. The last column
+    is the paired bootstrap p-value of the variant vs dense on evidence_recall@5 (first seed's items).
+    """
+    root = Path(root)
+    runs = defaultdict(lambda: defaultdict(dict))  # budget -> variant -> seed -> dir
+    for d in sorted(root.iterdir()) if root.exists() else []:
+        m = _RUN_RE.fullmatch(d.name)
+        if m and d.is_dir() and (d / "retrieval_quality.json").exists():
+            runs[int(m.group("budget"))][m.group("variant") or "v1"][int(m.group("seed"))] = d
+
+    lines: list[str] = []
+    data: dict = {}
+    for budget in sorted(runs):
+        per = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))  # ds -> row -> metric -> [seed means]
+        half = {}
+        meta = {}
+        pvals = {}
+        for variant in sorted(runs[budget]):
+            for n, seed in enumerate(sorted(runs[budget][variant])):
+                d = runs[budget][variant][seed]
+                res = json.loads((d / "retrieval_quality.json").read_text(encoding="utf-8"))
+                items = None
+                if n == 0 and (d / "retrieval_quality_per_item.json").exists():
+                    items = json.loads((d / "retrieval_quality_per_item.json").read_text(encoding="utf-8"))["datasets"]
+                for ds, r in res["datasets"].items():
+                    meta[ds] = (r["num_samples"], r["mean_candidates"], r["frac_with_gold"])
+                    for method, mets in r["summary"].items():
+                        row = variant if method == "maple" else method
+                        if method != "maple" and per[ds].get(row):
+                            continue  # baselines do not depend on the variant or seed: keep the first copy
+                        for metric in metrics:
+                            s_ = mets.get(metric)
+                            if s_ and s_["n"]:
+                                per[ds][row][metric].append(s_["mean"])
+                                half.setdefault((ds, row, metric), (s_["ci_high"] - s_["ci_low"]) / 2)
+                    if items is not None:
+                        pi = items.get(ds, {}).get("per_item", {})
+                        a, b = pi.get("maple", {}).get("evidence_recall@5"), pi.get("dense", {}).get("evidence_recall@5")
+                        if a and b:
+                            pvals[(ds, variant)] = M.paired_bootstrap_pvalue(a, b)
+        if not per:
+            continue
+        n_seeds = max(len(v) for d_ in per.values() for r_ in d_.values() for v in r_.values())
+        lines.append(f"\n### Teacher context budget {budget} tokens — held-out retrieval ({n_seeds} seed(s) max)\n")
+        for ds in sorted(per):
+            n_s, cand, gold = meta[ds]
+            lines.append(f"\n**{ds}** — {n_s} questions, {cand:.1f} candidate blocks/question, gold evidence for {gold * 100:.0f}%\n")
+            lines.append("| method | " + " | ".join(metrics) + " | p vs dense |")
+            lines.append("|---|" + "---|" * (len(metrics) + 1))
+            variants = sorted(r for r in per[ds] if r not in _BASELINE_ROWS)
+            for row in [r for r in _BASELINE_ROWS if r in per[ds]] + variants:
+                cells = []
+                for metric in metrics:
+                    vals = per[ds][row].get(metric)
+                    cells.append(_cell(vals, half.get((ds, row, metric), 0.0)) if vals else "n/a")
+                    if vals:
+                        data.setdefault(str(budget), {}).setdefault(ds, {}).setdefault(row, {})[metric] = {
+                            "mean": float(np.mean(vals)), "std_over_seeds": float(np.std(vals)),
+                            "seeds": len(vals), "ci95_half_first_seed": half.get((ds, row, metric), 0.0)}
+                p = pvals.get((ds, row))
+                if p is not None:
+                    data[str(budget)][ds][row]["p_vs_dense"] = p
+                lines.append(f"| {row} | " + " | ".join(cells) + f" | {'n/a' if p is None else f'{p:.3f}'} |")
+    return lines, data
+
+
 def latency_table() -> list[str]:
     f = RESULTS_DIR / "latency" / "latency_results.json"
     if not f.exists():
@@ -180,7 +266,20 @@ def latency_table() -> list[str]:
     return lines
 
 
-def main():
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="Aggregate benchmark results")
+    ap.add_argument("--root", type=Path, default=None,
+                    help="Aggregate a gate folder of <variant>_b<budget>_s<seed> runs instead of the v1 layout")
+    args = ap.parse_args(argv)
+    if args.root is not None:
+        lines, vdata = variant_tables(args.root)
+        md = [f"# MAPLE — gate summary ({args.root.name})", "",
+              "Cells: mean over seeds (%) ± std over seeds [± 95% bootstrap CI half-width of the first seed]. "
+              "Metric definitions: docs/METRICS.md.", ""] + lines
+        (args.root / "SUMMARY.md").write_text("\n".join(md) + "\n", encoding="utf-8")
+        (args.root / "SUMMARY.json").write_text(json.dumps(vdata, indent=2), encoding="utf-8")
+        print("\n".join(md))
+        return
     runs = _runs()
     ret_lines, ret_data = retrieval_tables(runs)
     md = ["# MAPLE — benchmark summary", "",
