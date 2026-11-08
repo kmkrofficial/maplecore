@@ -12,7 +12,7 @@ import math
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import List, Optional, Union
+from typing import TYPE_CHECKING, List, Optional, Union
 
 import numpy as np
 import torch
@@ -20,6 +20,9 @@ import torch
 from .core import MapleNet
 from .indexer import Index, compute_chapter_embeddings
 from .utils import _compute_entropy, resolve_device
+
+if TYPE_CHECKING:  # pragma: no cover
+    from .onnx_runner import MapleONNXRunner
 
 logger = logging.getLogger(__name__)
 

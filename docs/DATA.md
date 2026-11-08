@@ -48,13 +48,35 @@ Options: `--max-tokens` (teacher context budget, default 1,536 = v0.2.0),
 ### Label definition
 
 The teacher reads `[instruction][block_0]\n[block_1]\n…\n\nQuestion: q\nAnswer:`.
-For the final token, the attention row of every layer is captured by a forward
-hook (only that row is kept, so long contexts fit in 16 GB). Per block:
+For the final token, the attention row of every layer is recorded. Per block:
 
 * `attention_scores` — last layer, mean over heads, summed over the block's tokens
 * `attention_scores_all_layers` — same, averaged over all layers
 
 `top_5_block_ids` = the 5 highest `attention_scores` → positive training labels.
+
+### How the attention row is computed (`--attn-impl`)
+
+| | `fast` (default) | `eager` (reference) |
+|---|---|---|
+| Teacher attention kernel | PyTorch SDPA | eager (full `heads × L × L` matrix per layer) |
+| Last-token row | recomputed from the post-RoPE q/k that SDPA receives: `softmax(q_last·Kᵀ·scale + mask)` | read from the eager weight matrix by a forward hook |
+| Batching | left-padded batches (`--batch-size`), padded keys masked, LM head skipped | one prompt at a time |
+| Throughput, Llama-3-8B 4-bit, RTX 4090 Laptop | 2.3 samples/s @ 1,536 tok · 0.77 @ 4,096 | ≈ 0.9 @ 1,536 |
+
+Agreement on 200 HotpotQA validation samples (`scripts/compare_oracles.py`,
+fast vs eager): **top-5 identical for 200/200**, max per-block score difference
+1.1e-4 (fp16 vs fp32 rounding), mean Spearman 0.9995. `tests/test_oracle_fast.py`
+checks the same on a random tiny Llama, including padded batches.
+
+Each sample records `attn_impl`. In `data/oracle/` (1,536 budget),
+`hotpotqa_validation.json` and the first 475 samples of `narrativeqa_test.json`
+were generated with `eager`; everything else with `fast`.
+
+The fast path is compute-bound (~3k tokens/s); larger batches do not help
+beyond 2–4. One pitfall, handled in `score_batch`: an unpadded batch lets HF
+drop the attention mask, and SDPA's `is_causal` path ran ~25× slower on
+Windows at 4k tokens, so every batch keeps one masked pad column.
 
 ### Schema (v2)
 

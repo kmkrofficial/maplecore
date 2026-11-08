@@ -15,7 +15,7 @@ import math
 import re
 import string
 from collections import Counter
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Dict, Iterable, Optional, Sequence, Set, Tuple
 
 import numpy as np
 

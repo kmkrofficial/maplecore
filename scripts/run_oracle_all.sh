@@ -3,7 +3,8 @@
 # Usage: bash scripts/run_oracle_all.sh [TRAIN_N] [HELDOUT_N]
 #   Budget 1536 (v0.2.0 reproduction) -> data/oracle/*.json
 #   Budget 4096 (longer teacher context) -> data/oracle/t4096/*.json
-# Re-running resumes each file where it stopped.
+# Re-running resumes each file where it stopped. Uses the fast attention path
+# (SDPA + last-row capture), validated against eager: scripts/compare_oracles.py.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -25,10 +26,11 @@ run() {  # name, command...
 }
 
 for T in 1536 4096; do
-  DIR=data/oracle; [ "$T" = 4096 ] && DIR=data/oracle/t4096
-  run "hotpot_val_$T"   "$PY" scripts/generate_oracle_hotpot.py --split validation --max-samples "$HELDOUT_N" --max-tokens "$T" --output "$DIR/hotpotqa_validation.json"
-  run "nqa_test_$T"     "$PY" scripts/generate_oracle.py        --split test       --max-samples "$HELDOUT_N" --max-tokens "$T" --output "$DIR/narrativeqa_test.json"
-  run "hotpot_train_$T" "$PY" scripts/generate_oracle_hotpot.py --split train      --max-samples "$TRAIN_N"   --max-tokens "$T" --output "$DIR/hotpotqa_train.json"
-  run "nqa_train_$T"    "$PY" scripts/generate_oracle.py        --split train      --max-samples "$TRAIN_N"   --max-tokens "$T" --output "$DIR/narrativeqa_train.json"
+  DIR=data/oracle; BS=8
+  [ "$T" = 4096 ] && DIR=data/oracle/t4096 && BS=4   # throughput saturates at bs>=2-4
+  run "hotpot_val_$T"   "$PY" scripts/generate_oracle_hotpot.py --split validation --max-samples "$HELDOUT_N" --max-tokens "$T" --batch-size "$BS" --output "$DIR/hotpotqa_validation.json"
+  run "nqa_test_$T"     "$PY" scripts/generate_oracle.py        --split test       --max-samples "$HELDOUT_N" --max-tokens "$T" --batch-size "$BS" --output "$DIR/narrativeqa_test.json"
+  run "hotpot_train_$T" "$PY" scripts/generate_oracle_hotpot.py --split train      --max-samples "$TRAIN_N"   --max-tokens "$T" --batch-size "$BS" --output "$DIR/hotpotqa_train.json"
+  run "nqa_train_$T"    "$PY" scripts/generate_oracle.py        --split train      --max-samples "$TRAIN_N"   --max-tokens "$T" --batch-size "$BS" --output "$DIR/narrativeqa_train.json"
 done
 echo "[$(date +%H:%M:%S)] ALL ORACLE FILES DONE"

@@ -19,7 +19,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import gc
 import json
 import logging
 import sys
@@ -27,15 +26,13 @@ import time
 from collections import Counter
 from pathlib import Path
 
-import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from maplecore.indexer import MapleIndexer
 from scripts.oracle_common import (
     DEFAULT_TEACHER,
-    LastRowAttentionRecorder,
-    block_attention,
+    OracleScorer,
     build_prompt_with_mapping,
     load_teacher,
     make_metadata,
@@ -86,7 +83,8 @@ def flatten_hotpot(item: dict):
 
 
 def run(split: str = "train", max_samples: int = 500, max_tokens: int = 1536,
-        teacher: str = DEFAULT_TEACHER, resume: bool = False, output: Path | None = None) -> Path:
+        teacher: str = DEFAULT_TEACHER, resume: bool = False, output: Path | None = None,
+        attn_impl: str = "fast", batch_size: int = 8) -> Path:
     from datasets import load_dataset
 
     output = output or OUT_DIR / f"hotpotqa_{split}.json"
@@ -96,6 +94,7 @@ def run(split: str = "train", max_samples: int = 500, max_tokens: int = 1536,
     print(f"  Split:       {split}")
     print(f"  Max context: {max_tokens} tokens | chunk {CHUNK_SIZE} chars | top-{TOP_K}")
     print(f"  Max samples: {max_samples}")
+    print(f"  Attention:   {attn_impl} (batch {batch_size if attn_impl == 'fast' else 1})")
     print(f"  Output:      {output}")
     print("=" * 70)
 
@@ -106,19 +105,51 @@ def run(split: str = "train", max_samples: int = 500, max_tokens: int = 1536,
         done = {s["id"] for s in samples}
 
     dataset = load_dataset("hotpotqa/hotpot_qa", "distractor", split=split)
-    model, tokenizer = load_teacher(teacher)
-    recorder = LastRowAttentionRecorder(model)
+    model, tokenizer = load_teacher(teacher, attn_impl=attn_impl)
+    scorer = OracleScorer(model, tokenizer, attn_impl)
+    if attn_impl == "eager":
+        batch_size = 1
     chunker = MapleIndexer(device="cpu")
     skipped = Counter()
     start_time = time.time()
+    new_count = 0
+    pending = []  # (record without scores, input_ids, block_ranges)
+    last_save = len(samples)
 
     def save(final: bool = False):
         meta = make_metadata("hotpotqa_distractor", teacher, max_tokens, CHUNK_SIZE, TOP_K,
-                             len(samples), split, skipped=dict(skipped), complete=final)
+                             len(samples), split, skipped=dict(skipped), complete=final,
+                             attn_impl=attn_impl, batch_size=batch_size)
         save_json({"metadata": meta, "samples": samples}, output)
 
+    def flush():
+        nonlocal new_count, last_save
+        if not pending:
+            return
+        results = scorer.score([(ids, ranges) for _, ids, ranges in pending])
+        for (rec, ids, ranges), res in zip(pending, results):
+            if res is None:
+                skipped["oom"] += 1
+                continue
+            last_scores, all_scores = res
+            ranked = sorted(last_scores.items(), key=lambda x: x[1], reverse=True)
+            rec["top_5_block_ids"] = [bid for bid, _ in ranked[:TOP_K]]
+            rec["attention_scores"] = {str(k): round(v, 6) for k, v in ranked}
+            rec["attention_scores_all_layers"] = {str(k): round(v, 6) for k, v in all_scores.items()}
+            rec["attn_impl"] = attn_impl
+            samples.append(rec)
+            new_count += 1
+        pending.clear()
+        rate = new_count / max(time.time() - start_time, 1e-6)
+        s = samples[-1]
+        logger.info(f"[{len(samples):>4d}/{max_samples}] blocks={s['num_blocks_in_context']} "
+                    f"top={s['top_5_block_ids']} gold={s['gold_block_ids']} ({rate:.2f}/s)")
+        if len(samples) - last_save >= CHECKPOINT_EVERY:
+            save()
+            last_save = len(samples)
+
     for item in dataset:
-        if len(samples) >= max_samples:
+        if len(samples) + len(pending) >= max_samples:
             break
         if item["id"] in done:
             continue
@@ -130,20 +161,9 @@ def run(split: str = "train", max_samples: int = 500, max_tokens: int = 1536,
             skipped["too_few_blocks"] += 1
             continue
 
-        try:
-            last_scores, all_scores = block_attention(model, recorder, input_ids, block_ranges)
-        except torch.cuda.OutOfMemoryError:
-            torch.cuda.empty_cache()
-            gc.collect()
-            skipped["oom"] += 1
-            continue
-
-        ranked = sorted(last_scores.items(), key=lambda x: x[1], reverse=True)
         in_context_ids = {bid for bid, _, _ in block_ranges}
         in_context = [b for b in blocks if b.id in in_context_ids]
-        gold = overlapping_block_ids(in_context, sent_spans)
-
-        samples.append({
+        pending.append(({
             "id": item["id"],
             "domain": "hotpot_qa",
             "type": item.get("type"),
@@ -151,25 +171,21 @@ def run(split: str = "train", max_samples: int = 500, max_tokens: int = 1536,
             "question": item["question"],
             "answers": [item["answer"]],
             "blocks": [{"id": b.id, "text": b.text} for b in in_context],
-            "top_5_block_ids": [bid for bid, _ in ranked[:TOP_K]],
-            "attention_scores": {str(k): round(v, 6) for k, v in ranked},
-            "attention_scores_all_layers": {str(k): round(v, 6) for k, v in all_scores.items()},
-            "gold_block_ids": gold,
+            "gold_block_ids": overlapping_block_ids(in_context, sent_spans),
             "gold_paragraph_block_ids": overlapping_block_ids(in_context, para_spans),
             "num_blocks_in_context": len(block_ranges),
             "num_blocks_total": len(blocks),
             "seq_len": int(input_ids.shape[1]),
-        })
+        }, input_ids, block_ranges))
+        if len(pending) >= batch_size:
+            flush()
 
-        rate = len(samples) / max(time.time() - start_time, 1e-6)
-        logger.info(f"[{len(samples):>4d}/{max_samples}] blocks={len(block_ranges)} "
-                    f"top={samples[-1]['top_5_block_ids']} gold={gold} ({rate:.2f}/s)")
-        if len(samples) % CHECKPOINT_EVERY == 0:
-            save()
-
-    recorder.remove()
+    flush()
+    scorer.close()
     save(final=True)
-    print(f"\nDone: {len(samples)} samples in {time.time() - start_time:.0f}s; skipped={dict(skipped)}")
+    elapsed = time.time() - start_time
+    print(f"\nDone: {new_count} new samples ({len(samples)} total) in {elapsed:.0f}s "
+          f"({new_count / max(elapsed, 1e-6):.2f}/s); skipped={dict(skipped)}")
     print(f"Output: {output}")
     return output
 
@@ -182,5 +198,8 @@ if __name__ == "__main__":
     p.add_argument("--teacher", default=DEFAULT_TEACHER)
     p.add_argument("--output", type=Path, default=None)
     p.add_argument("--resume", action="store_true")
+    p.add_argument("--attn-impl", choices=["fast", "eager"], default="fast",
+                   help="fast = SDPA + last-row capture, batched; eager = v0.2.0-style reference")
+    p.add_argument("--batch-size", type=int, default=8, help="Prompts per forward pass (fast path)")
     a = p.parse_args()
-    run(a.split, a.max_samples, a.max_tokens, a.teacher, a.resume, a.output)
+    run(a.split, a.max_samples, a.max_tokens, a.teacher, a.resume, a.output, a.attn_impl, a.batch_size)

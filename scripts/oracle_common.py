@@ -17,10 +17,19 @@ Additionally recorded (new, for validating the label — see docs/METRICS.md):
     * ``gold_block_ids``: blocks that contain the dataset's evidence
       (HotpotQA supporting sentences / NarrativeQA answer strings)
 
-Memory: instead of ``output_attentions=True`` (which keeps every layer's full
-``[heads, L, L]`` matrix alive), a forward hook on each attention module keeps
-only the last query row. This lets the context budget go well beyond 1,536
-tokens on a 16 GB GPU.
+Two interchangeable ways to read the final token's attention:
+
+* ``attn_impl="fast"`` (default) - the teacher runs on PyTorch SDPA kernels
+  (never materialising ``[heads, L, L]``). ``LastRowCapture`` wraps the SDPA
+  attention function and, from the post-RoPE query/key it receives, computes
+  only ``softmax(q_last . K^T . scale [+ mask])`` per layer. Samples are batched
+  with left padding (padded keys masked; RoPE is relative so positions are
+  shift-invariant) and the LM head is skipped.
+* ``attn_impl="eager"`` - the v0.2.0-style reference: eager attention plus a
+  forward hook keeping the last row of the full weight matrix. Batch size 1.
+
+``tests/test_oracle_fast.py`` checks the two agree on a random tiny Llama, and
+``docs/DATA.md`` records the agreement measured on the real teacher.
 """
 
 from __future__ import annotations
@@ -31,7 +40,7 @@ import re
 import string
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Sequence, Tuple
 
 import torch
 
@@ -46,11 +55,13 @@ PROMPT_PREFIX = "Read the following context carefully and answer the question.\n
 # Teacher model
 # ===================================================================
 
-def load_teacher(model_id: str = DEFAULT_TEACHER, load_in_4bit: bool = True):
-    """Load a causal LM with eager attention (needed to read attention weights)."""
+def load_teacher(model_id: str = DEFAULT_TEACHER, load_in_4bit: bool = True, attn_impl: str = "fast"):
+    """Load the teacher. ``attn_impl``: "fast" (SDPA + LastRowCapture) or "eager"."""
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    kwargs = dict(attn_implementation="eager", dtype=torch.float16)
+    if attn_impl not in ("fast", "eager"):
+        raise ValueError("attn_impl must be 'fast' or 'eager'")
+    kwargs = dict(attn_implementation="sdpa" if attn_impl == "fast" else "eager", dtype=torch.float16)
     if load_in_4bit and torch.cuda.is_available():
         from transformers import BitsAndBytesConfig
         kwargs["quantization_config"] = BitsAndBytesConfig(
@@ -63,7 +74,7 @@ def load_teacher(model_id: str = DEFAULT_TEACHER, load_in_4bit: bool = True):
     elif not torch.cuda.is_available():
         kwargs["dtype"] = torch.float32
 
-    logger.info(f"Loading teacher {model_id} (4-bit={load_in_4bit and torch.cuda.is_available()})")
+    logger.info(f"Loading teacher {model_id} (4-bit={load_in_4bit and torch.cuda.is_available()}, attn={attn_impl})")
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -108,6 +119,145 @@ class LastRowAttentionRecorder:
         for h in self._handles:
             h.remove()
         self._handles = []
+
+
+class LastRowCapture:
+    """
+    Context manager: wrap the SDPA attention function so every layer also
+    records the head-averaged attention row of the LAST query position.
+
+    ``rows`` gets one ``[batch, key_len]`` float32 CPU tensor per layer.
+    """
+
+    def __init__(self):
+        self.rows: List[torch.Tensor] = []
+        self._orig = None
+
+    def _wrapper(self, module, query, key, value, attention_mask, *args, **kwargs):
+        out = self._orig(module, query, key, value, attention_mask, *args, **kwargs)
+        with torch.no_grad():
+            q = query[:, :, -1:, :].float()                       # [B, Hq, 1, d]
+            k = key.float()                                        # [B, Hkv, L, d]
+            groups = q.shape[1] // k.shape[1]
+            if groups > 1:
+                k = k.repeat_interleave(groups, dim=1)             # same as HF repeat_kv
+            scaling = kwargs.get("scaling")
+            scale = scaling if scaling is not None else q.shape[-1] ** -0.5
+            scores = torch.matmul(q, k.transpose(-1, -2)) * scale  # [B, H, 1, L]
+            softcap = kwargs.get("softcap")
+            if softcap is not None:
+                scores = torch.tanh(scores / softcap) * softcap
+            if attention_mask is not None:
+                m = attention_mask[:, :, -1:, : k.shape[-2]]
+                if m.dtype == torch.bool:
+                    scores = scores.masked_fill(~m, float("-inf"))
+                else:
+                    scores = scores + m.float()
+            probs = torch.softmax(scores, dim=-1).mean(dim=1)[:, 0, :]  # [B, L]
+            self.rows.append(probs.cpu())
+        return out
+
+    def __enter__(self):
+        from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+        self._registry = ALL_ATTENTION_FUNCTIONS
+        self._orig = ALL_ATTENTION_FUNCTIONS["sdpa"]
+        ALL_ATTENTION_FUNCTIONS["sdpa"] = self._wrapper
+        self.rows = []
+        return self
+
+    def __exit__(self, *exc):
+        self._registry["sdpa"] = self._orig
+        return False
+
+
+def _aggregate(last: torch.Tensor, mean_all: torch.Tensor,
+               block_ranges: List[Tuple[int, int, int]]) -> Tuple[Dict[int, float], Dict[int, float]]:
+    last_scores, all_scores = {}, {}
+    for bid, s, e in block_ranges:
+        last_scores[bid] = float(last[s:e].sum())
+        all_scores[bid] = float(mean_all[s:e].sum())
+    return last_scores, all_scores
+
+
+@torch.no_grad()
+def score_batch(
+    model,
+    items: Sequence[Tuple[torch.Tensor, List[Tuple[int, int, int]]]],
+    pad_token_id: int,
+) -> List[Tuple[Dict[int, float], Dict[int, float]]]:
+    """
+    Fast path: score several prompts in one left-padded forward pass.
+
+    Args:
+        items: (input_ids [1, L_i], block_ranges) pairs from build_prompt_with_mapping.
+    Returns:
+        One (last-layer scores, all-layer-mean scores) pair per item.
+    """
+    device = next(model.parameters()).device
+    seqs = [ids.reshape(-1) for ids, _ in items]
+    # +1: always keep at least one masked pad column. With an all-ones mask HF drops
+    # the mask and SDPA takes its is_causal path, which on Windows fell back to a
+    # kernel ~25x slower at 4k tokens (0.03 vs 0.73 samples/s measured).
+    max_len = max(len(x) for x in seqs) + 1
+    input_ids = torch.full((len(seqs), max_len), pad_token_id, dtype=torch.long)
+    mask = torch.zeros((len(seqs), max_len), dtype=torch.long)
+    pads = []
+    for i, x in enumerate(seqs):
+        pad = max_len - len(x)
+        input_ids[i, pad:] = x
+        mask[i, pad:] = 1
+        pads.append(pad)
+    position_ids = (mask.cumsum(-1) - 1).clamp(min=0)
+
+    base = getattr(model, "model", model)  # skip the LM head: only attention is needed
+    with LastRowCapture() as cap:
+        base(input_ids=input_ids.to(device), attention_mask=mask.to(device),
+             position_ids=position_ids.to(device), use_cache=False)
+    if not cap.rows:
+        raise RuntimeError("No attention rows captured; is the teacher using attn_implementation='sdpa'?")
+
+    stacked = torch.stack(cap.rows)  # [layers, B, L]
+    last, mean_all = stacked[-1], stacked.mean(dim=0)
+    return [_aggregate(last[i, p:], mean_all[i, p:], ranges)
+            for i, ((_, ranges), p) in enumerate(zip(items, pads))]
+
+
+def score_batch_safe(model, items, pad_token_id):
+    """score_batch that halves the batch on CUDA OOM; None for items that still OOM alone."""
+    try:
+        return score_batch(model, items, pad_token_id)
+    except torch.cuda.OutOfMemoryError:
+        torch.cuda.empty_cache()
+        if len(items) == 1:
+            return [None]
+        mid = len(items) // 2
+        return score_batch_safe(model, items[:mid], pad_token_id) + score_batch_safe(model, items[mid:], pad_token_id)
+
+
+class OracleScorer:
+    """Uniform interface over the fast (batched) and eager (reference) paths."""
+
+    def __init__(self, model, tokenizer, attn_impl: str = "fast"):
+        self.model, self.attn_impl = model, attn_impl
+        self.pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+        self.recorder = LastRowAttentionRecorder(model) if attn_impl == "eager" else None
+
+    def score(self, items):
+        """items: list of (input_ids, block_ranges). Returns a list of score pairs (or None on OOM)."""
+        if self.attn_impl == "fast":
+            return score_batch_safe(self.model, items, self.pad_id)
+        out = []
+        for ids, ranges in items:
+            try:
+                out.append(block_attention(self.model, self.recorder, ids, ranges))
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                out.append(None)
+        return out
+
+    def close(self):
+        if self.recorder:
+            self.recorder.remove()
 
 
 # ===================================================================
