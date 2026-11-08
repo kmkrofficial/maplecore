@@ -58,6 +58,30 @@ def rows_to_groups(rows: Sequence[dict]) -> List[QueryGroup]:
     return groups
 
 
+def add_distractors(groups: Sequence[QueryGroup], n: int, seed: int = 0) -> List[QueryGroup]:
+    """Append ``n`` random blocks from OTHER groups to every group, with target mass 0.
+
+    Real candidate pools are mostly unrelated text; training only on a question's own ~11 related blocks
+    (v1) produced a scorer that collapsed on pools of 100+ blocks. If fewer than ``n`` foreign blocks exist,
+    all of them are used. Deterministic given ``seed``.
+    """
+    if n <= 0:
+        return list(groups)
+    rng = np.random.default_rng(seed)
+    all_blocks = torch.cat([g.blocks for g in groups])
+    owner = torch.cat([torch.full((g.blocks.shape[0],), i, dtype=torch.long) for i, g in enumerate(groups)])
+    out: List[QueryGroup] = []
+    for i, g in enumerate(groups):
+        cand = (owner != i).nonzero().flatten()
+        take = min(n, cand.numel())
+        idx = cand[torch.from_numpy(rng.choice(cand.numel(), size=take, replace=False))] if take else cand[:0]
+        extra = all_blocks[idx]
+        gold = None if g.gold is None else torch.cat([g.gold, torch.zeros(take, dtype=torch.bool)])
+        out.append(QueryGroup(g.group, g.q, torch.cat([g.blocks, extra]),
+                              torch.cat([g.target, torch.zeros(take)]), gold))
+    return out
+
+
 def _oracle_groups(oracle: Path, cache_file: Path, encoder: str, target_source: str, temperature: float,
                    skipped: Counter) -> List[QueryGroup]:
     samples = load_oracle_samples(oracle)
@@ -96,6 +120,7 @@ def run(
     batch_groups: int = 32,
     patience: int = 5,
     device: Optional[str] = None,
+    distractors: int = 0,
 ) -> dict:
     """Train a scorer on oracle files and save it (plus ``<output stem>.train.json``). Returns the summary."""
     if model_kind not in MODEL_KINDS:
@@ -120,6 +145,7 @@ def run(
         from scripts.train_generalist import build_needle_rows
         groups.extend(rows_to_groups(build_needle_rows(MapleIndexer(model_name=encoder, device=device),
                                                        needle_samples, seed=seed)))
+    groups = add_distractors(groups, distractors, seed=seed)
     if len(groups) < 10:
         raise ValueError(f"only {len(groups)} usable training groups; check the oracle files / target source")
 
@@ -142,7 +168,7 @@ def run(
         "target_source": target_source, "temperature": temperature, "model_kind": model_kind,
         "encoder": encoder, "epochs": epochs, "seed": seed, "val_fraction": val_fraction,
         "needle_samples": needle_samples, "lr": lr, "tau": tau, "batch_groups": batch_groups,
-        "patience": patience, "dim": dim,
+        "patience": patience, "dim": dim, "distractors": distractors,
         "groups": {"train": len(train), "val": len(val)},
         "skipped": dict(skipped),
         "parameters": sum(p.numel() for p in model.parameters()),
@@ -180,11 +206,13 @@ def main(argv: Optional[List[str]] = None) -> dict:
     p.add_argument("--tau", type=float, default=1.0)
     p.add_argument("--batch-groups", type=int, default=32)
     p.add_argument("--patience", type=int, default=5)
+    p.add_argument("--distractors", type=int, default=0,
+                   help="Random blocks from other questions appended to every group (target mass 0)")
     p.add_argument("--device", default=None)
     a = p.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
     out = run(a.train_oracles, a.output, a.target_source, a.temperature, a.model_kind, a.encoder, a.epochs,
-              a.seed, a.val_fraction, a.needle_samples, None, a.lr, a.tau, a.batch_groups, a.patience, a.device)
+              a.seed, a.val_fraction, a.needle_samples, None, a.lr, a.tau, a.batch_groups, a.patience, a.device, a.distractors)
     print(f"best {out['metric']}: {out['best_val'] * 100:.1f}%  ->  {a.output}")
     return out
 

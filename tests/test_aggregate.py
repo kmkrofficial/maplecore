@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from benchmarks.aggregate_results import variant_tables
+from benchmarks.aggregate_results import long_context_variant_tables, variant_tables
 
 
 def _summ(mean, n=100):
@@ -68,3 +68,30 @@ def test_ignores_folders_without_results(tmp_path):
     (tmp_path / "notes").mkdir()
     lines, data = variant_tables(tmp_path)
     assert data == {}
+
+
+def _write_lc(root: Path, name: str, maple_by_pool: dict, nqa: float = 0.05):
+    results = {str(p): {"dense": {"evidence_recall@5": _summ(0.86)}, "bm25": {"evidence_recall@5": _summ(0.65)},
+                        "maple_linear": {"evidence_recall@5": _summ(v)}} for p, v in maple_by_pool.items()}
+    lc = {"hotpotqa": {"pool_sizes": list(maple_by_pool), "num_questions": 300, "results": results},
+          "narrativeqa": {"num_questions": 300, "gold_coverage": 0.35, "results": {
+              "dense": {"evidence_recall@5": _summ(0.10)}, "bm25": {"evidence_recall@5": _summ(0.06)},
+              "maple_linear": {"evidence_recall@5": _summ(nqa)}}}}
+    d = root / name
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "long_context.json").write_text(json.dumps(lc), encoding="utf-8")
+
+
+def test_long_context_variant_table(tmp_path):
+    _write_lc(tmp_path, "A1_b1536_s42", {10: 0.70, 1000: 0.80}, nqa=0.12)
+    _write_lc(tmp_path, "A2_b1536_s42", {10: 0.70, 1000: 0.10})
+    lines, data = long_context_variant_tables(tmp_path)
+    assert data["A1"]["hotpotqa"]["1000"] == pytest.approx(0.80) and data["A2"]["hotpotqa"]["1000"] == pytest.approx(0.10)
+    assert data["dense"]["hotpotqa"]["1000"] == pytest.approx(0.86) and data["A1"]["narrativeqa"] == pytest.approx(0.12)
+    text = "\n".join(lines)
+    assert "| A1 |" in text and "| A2 |" in text and "| dense |" in text and "| bm25 |" in text
+
+
+def test_long_context_variant_table_empty_without_results(tmp_path):
+    (tmp_path / "A1_b1536_s42").mkdir()
+    assert long_context_variant_tables(tmp_path) == ([], {})

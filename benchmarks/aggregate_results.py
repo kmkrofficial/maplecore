@@ -251,6 +251,50 @@ def variant_tables(root: Path, metrics=VARIANT_METRICS) -> tuple[list[str], dict
     return lines, data
 
 
+def long_context_variant_tables(root: Path) -> tuple[list[str], dict]:
+    """Benchmark-07 results of each ``<variant>_b1536_s*`` run: HotpotQA evidence_recall@5 by pool size
+    and NarrativeQA full-story evidence_recall@5, MAPLE (linear scan) vs the BM25 / dense baselines.
+    Uses the lowest seed available per variant."""
+    root = Path(root)
+    found = {}
+    for d in sorted(root.iterdir()) if root.exists() else []:
+        m = _RUN_RE.fullmatch(d.name)
+        if m and int(m.group("budget")) == 1536 and (d / "long_context.json").exists():
+            v, seed = m.group("variant") or "v1", int(m.group("seed"))
+            if v not in found or seed < found[v][0]:
+                found[v] = (seed, d)
+    if not found:
+        return [], {}
+
+    data: dict = {}
+    lines = ["\n### Long-context check (benchmark 07, teacher budget 1536, lowest seed per variant)\n"]
+    pools = None
+    for v in sorted(found):
+        lc = json.loads((found[v][1] / "long_context.json").read_text(encoding="utf-8"))
+        h, n = lc.get("hotpotqa"), lc.get("narrativeqa")
+        if h and pools is None:
+            pools = [str(x) for x in h["pool_sizes"]]
+        for method, row in (("bm25", "bm25"), ("dense", "dense"), ("maple_linear", v)):
+            if row in data and method != "maple_linear":
+                continue
+            entry = data.setdefault(row, {})
+            if h:
+                entry["hotpotqa"] = {str(sz): h["results"][str(sz)][method]["evidence_recall@5"]["mean"]
+                                     for sz in h["pool_sizes"]}
+            if n:
+                entry["narrativeqa"] = n["results"][method]["evidence_recall@5"]["mean"]
+    if pools:
+        lines.append("HotpotQA + random distractors, evidence_recall@5 (%) by pool size (blocks); NarrativeQA = full stories\n")
+        lines.append("| method | " + " | ".join(pools) + " | NarrativeQA full story |")
+        lines.append("|---|" + "---|" * (len(pools) + 1))
+        for row in ["bm25", "dense"] + sorted(v for v in found):
+            e = data[row]
+            cells = [_pct(e["hotpotqa"][sz]) if "hotpotqa" in e and sz in e["hotpotqa"] else "n/a" for sz in pools]
+            nq = _pct(e["narrativeqa"]) if "narrativeqa" in e else "n/a"
+            lines.append(f"| {row} | " + " | ".join(cells) + f" | {nq} |")
+    return lines, data
+
+
 def latency_table() -> list[str]:
     f = RESULTS_DIR / "latency" / "latency_results.json"
     if not f.exists():
@@ -273,6 +317,9 @@ def main(argv=None):
     args = ap.parse_args(argv)
     if args.root is not None:
         lines, vdata = variant_tables(args.root)
+        lc_lines, lc_data = long_context_variant_tables(args.root)
+        lines += lc_lines
+        vdata = {"retrieval": vdata, "long_context": lc_data}
         md = [f"# MAPLE — gate summary ({args.root.name})", "",
               "Cells: mean over seeds (%) ± std over seeds [± 95% bootstrap CI half-width of the first seed]. "
               "Metric definitions: docs/METRICS.md.", ""] + lines

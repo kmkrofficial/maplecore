@@ -17,15 +17,17 @@ export HF_HUB_CACHE="${HF_HUB_CACHE:-$PWD/.cache/huggingface/hub}"
 export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-$PWD/.cache/huggingface/datasets}"
 export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 PYTHONIOENCODING=utf-8
 
-# variant grid: "id model_kind target_source temperature datasets(both|hotpot)"
+# variant grid: "id model_kind target_source temperature datasets(both|hotpot) distractors"
 variants() {
   case "$1" in
     gate_a)
-      echo "A1 residual all_layers 1.0 both"
-      echo "A2 residual all_layers 0.5 both"
-      echo "A3 residual last 1.0 both"
-      echo "A4 mlp all_layers 1.0 both"
-      echo "A5 residual gold 1.0 hotpot" ;;
+      echo "A1 residual all_layers 1.0 both 0"
+      echo "A2 residual all_layers 0.5 both 0"
+      echo "A3 residual last 1.0 both 0"
+      echo "A4 mlp all_layers 1.0 both 0"
+      echo "A5 residual gold 1.0 hotpot 0"
+      echo "A6 residual all_layers 1.0 both 30"
+      echo "A7 residual all_layers 1.0 both 100" ;;
     *) echo "unknown gate '$1' (define it in scripts/run_gate.sh)" >&2; return 1 ;;
   esac
 }
@@ -42,20 +44,29 @@ echo "[$(stamp)] caches"
 VARIANTS=$(variants "$GATE")
 for B in 1536 4096; do
   DIR=$(oracle_dir "$B")
-  while read -r V KIND SRC TEMP DS; do
+  while read -r V KIND SRC TEMP DS DIST; do
     for S in "${SEEDS[@]}"; do
       RUN="${V}_b${B}_s${S}"; OUT="$R/$RUN"
-      if [ -f "$OUT/retrieval_quality.json" ]; then echo "[$(stamp)] skip $RUN (done)"; continue; fi
-      if [ "$DS" = hotpot ]; then ORACLES="$DIR/hotpotqa_train.json"; else ORACLES="$DIR/hotpotqa_train.json $DIR/narrativeqa_train.json"; fi
-      echo "[$(stamp)] train $RUN ($KIND, $SRC, T=$TEMP, $DS)"
-      "$PY" scripts/train_v2.py --train-oracles $ORACLES --output "$M/$RUN.pt" --model-kind "$KIND" \
-        --target-source "$SRC" --temperature "$TEMP" --seed "$S" > "$L/train_$RUN.log" 2>&1
-      echo "[$(stamp)]   $(grep -h 'best ' "$L/train_$RUN.log" | tail -n 1)"
-      "$PY" benchmarks/01_recall_enhanced.py --model "$M/$RUN.pt" --oracle-dir "$DIR" > "$L/bench01_$RUN.log" 2>&1
-      mkdir -p "$OUT"
-      for f in retrieval_quality.json retrieval_quality_per_item.json recall_grouped_bar.png; do
-        if [ -e "benchmarks/results/$f" ]; then mv "benchmarks/results/$f" "$OUT/"; fi
-      done
+      if [ -f "$OUT/retrieval_quality.json" ]; then
+        echo "[$(stamp)] skip $RUN (done)"
+      else
+        if [ "$DS" = hotpot ]; then ORACLES="$DIR/hotpotqa_train.json"; else ORACLES="$DIR/hotpotqa_train.json $DIR/narrativeqa_train.json"; fi
+        echo "[$(stamp)] train $RUN ($KIND, $SRC, T=$TEMP, $DS, distractors=$DIST)"
+        "$PY" scripts/train_v2.py --train-oracles $ORACLES --output "$M/$RUN.pt" --model-kind "$KIND" \
+          --target-source "$SRC" --temperature "$TEMP" --seed "$S" --distractors "$DIST" > "$L/train_$RUN.log" 2>&1
+        echo "[$(stamp)]   $(grep -h 'best ' "$L/train_$RUN.log" | tail -n 1)"
+        "$PY" benchmarks/01_recall_enhanced.py --model "$M/$RUN.pt" --oracle-dir "$DIR" > "$L/bench01_$RUN.log" 2>&1
+        mkdir -p "$OUT"
+        for f in retrieval_quality.json retrieval_quality_per_item.json recall_grouped_bar.png; do
+          if [ -e "benchmarks/results/$f" ]; then mv "benchmarks/results/$f" "$OUT/"; fi
+        done
+      fi
+      # long-context check (pre-registered Gate A criterion): first seed, budget 1536 only
+      if [ "$B" = 1536 ] && [ "$S" = "${SEEDS[0]}" ] && [ ! -f "$OUT/long_context.json" ]; then
+        echo "[$(stamp)] long-context $RUN"
+        "$PY" benchmarks/07_long_context.py --model "$M/$RUN.pt" --max-questions 300 > "$L/bench07_$RUN.log" 2>&1
+        if [ -e benchmarks/results/long_context.json ]; then mv benchmarks/results/long_context.json "$OUT/"; fi
+      fi
     done
   done <<< "$VARIANTS"
 done

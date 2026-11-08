@@ -6,7 +6,8 @@ import torch
 
 from maplecore import load_model
 from scripts.embedding_cache import build_cache
-from scripts.train_v2 import rows_to_groups, run
+from maplecore.listwise import QueryGroup
+from scripts.train_v2 import add_distractors, rows_to_groups, run
 
 from test_embedding_cache import FakeIndexer
 
@@ -90,3 +91,47 @@ def test_rows_to_groups_converts_flat_rows():
     assert groups["needle::0"].blocks.shape == (3, 8) and groups["needle::0"].target.tolist() == [1.0, 0.0, 0.0]
     assert groups["needle::0"].gold.tolist() == [True, False, False]
     assert groups["needle::1"].blocks.shape == (1, 8)
+
+
+# ------------------------------------------------------- cross-document distractors
+
+def _group(i: int, n: int = 4, dim: int = 8, with_gold: bool = False) -> QueryGroup:
+    g = torch.Generator().manual_seed(i)
+    target = torch.softmax(torch.randn(n, generator=g), dim=0)
+    gold = torch.zeros(n, dtype=torch.bool) if with_gold else None
+    if gold is not None:
+        gold[0] = True
+    return QueryGroup(f"g{i}", torch.randn(dim, generator=g), torch.randn(n, dim, generator=g), target, gold)
+
+
+def test_add_distractors_extends_with_zero_target_blocks():
+    groups = [_group(i, with_gold=True) for i in range(5)]
+    out = add_distractors(groups, 6, seed=0)
+    for g, o in zip(groups, out):
+        assert o.blocks.shape[0] == 4 + 6 and torch.equal(o.blocks[:4], g.blocks) and torch.equal(o.q, g.q)
+        assert torch.equal(o.target[:4], g.target) and o.target[4:].sum() == 0
+        assert o.gold.shape[0] == 10 and o.gold[4:].sum() == 0 and torch.equal(o.gold[:4], g.gold)
+        own = {tuple(r.tolist()) for r in g.blocks}
+        assert all(tuple(r.tolist()) not in own for r in o.blocks[4:])     # never the group's own blocks
+
+
+def test_add_distractors_is_seeded_and_zero_is_identity():
+    groups = [_group(i) for i in range(5)]
+    a, b = add_distractors(groups, 3, seed=7), add_distractors(groups, 3, seed=7)
+    assert all(torch.equal(x.blocks, y.blocks) for x, y in zip(a, b))
+    same = add_distractors(groups, 0)
+    assert all(x.blocks.shape[0] == 4 for x in same)
+
+
+def test_add_distractors_small_pool_uses_what_exists():
+    groups = [_group(0, n=2), _group(1, n=2)]
+    out = add_distractors(groups, 100, seed=0)
+    assert [o.blocks.shape[0] for o in out] == [4, 4]       # each group gets the other group's 2 blocks
+
+
+def test_train_v2_records_distractors(tmp_path):
+    oracle = _write_oracle(tmp_path, n_samples=20, blocks_per_sample=[5] * 20)
+    cache = build_cache(oracle, tmp_path / "c.pt", indexer=FakeIndexer(8, "fake-enc"))
+    run([oracle], tmp_path / "m.pt", encoder="fake-enc", epochs=1, cache_paths=[cache], device="cpu", distractors=6)
+    summary = json.loads((tmp_path / "m.train.json").read_text(encoding="utf-8"))
+    assert summary["distractors"] == 6
