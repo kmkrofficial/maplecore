@@ -82,48 +82,28 @@ class MapleNet(nn.Module):
         torch.save(self.state_dict(), path)
         logger.info(f"Model saved to {path}")
         
+    @property
+    def config(self) -> dict:
+        """Constructor arguments, stored in v2 checkpoints (see maplecore.models)."""
+        return {"input_dim": self.input_dim, "hidden_dim": self.hidden_dim, "dropout": self.dropout_rate}
+
     def export_to_onnx(
-        self, 
-        save_path: Union[str, Path], 
+        self,
+        save_path: Union[str, Path],
         dummy_input_shape: Optional[tuple] = None
     ) -> None:
         """
         Export the MAPLE model to ONNX format for production inference.
-        
+
         Args:
             save_path: Path to save the .onnx file
             dummy_input_shape: Shape of the input tensor. Defaults to
                                (1, self.input_dim), i.e. concatenated
                                (query + block) embeddings.
         """
-        save_path = Path(save_path)
-        save_path.parent.mkdir(parents=True, exist_ok=True)
-        if dummy_input_shape is None:
-            dummy_input_shape = (1, self.input_dim)
-        was_training = self.training
-        self.eval()
-        
-        # We match dtype with model weight dtype
-        dummy_input = torch.randn(dummy_input_shape, device=next(self.parameters()).device, dtype=next(self.parameters()).dtype)
-        
-        torch.onnx.export(
-            self,
-            dummy_input,
-            save_path,
-            export_params=True,
-            opset_version=14,
-            do_constant_folding=True,
-            input_names=["input"],
-            output_names=["output"],
-            dynamic_axes={
-                "input": {0: "batch_size"},
-                "output": {0: "batch_size"}
-            }
-        )
-        if was_training:
-            self.train()
-        logger.info(f"ONNX Model exported successfully to {save_path}")
-    
+        from .models import export_to_onnx
+        export_to_onnx(self, save_path, input_dim=dummy_input_shape[1] if dummy_input_shape else None)
+
     @classmethod
     def load(
         cls, 

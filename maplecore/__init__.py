@@ -61,6 +61,7 @@ Utilities:
 from .client import Maple
 from .core import MapleNet
 from .indexer import Block, Index, MapleIndexer
+from .models import MapleResidualNet, load_model, save_model
 from .search import MapleScanner, SearchResult, SearchStrategy
 from .trainer import MapleTrainer
 from .utils import get_device, setup_logging
@@ -73,6 +74,9 @@ __all__ = [
     "Maple",
     # Model & Search
     "MapleNet",
+    "MapleResidualNet",
+    "load_model",
+    "save_model",
     "MapleScanner",
     "MapleIndexer",
     "MapleTrainer",
