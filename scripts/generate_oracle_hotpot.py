@@ -32,6 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from maplecore.indexer import MapleIndexer
 from scripts.oracle_common import (
     DEFAULT_TEACHER,
+    HeadStore,
     OracleScorer,
     build_prompt_with_mapping,
     load_teacher,
@@ -84,8 +85,11 @@ def flatten_hotpot(item: dict):
 
 def run(split: str = "train", max_samples: int = 500, max_tokens: int = 1536,
         teacher: str = DEFAULT_TEACHER, resume: bool = False, output: Path | None = None,
-        attn_impl: str = "fast", batch_size: int = 8) -> Path:
+        attn_impl: str = "fast", batch_size: int = 8, save_heads: bool = False) -> Path:
     from datasets import load_dataset
+
+    if save_heads and attn_impl != "fast":
+        raise ValueError("--save-heads requires --attn-impl fast")
 
     output = output or OUT_DIR / f"hotpotqa_{split}.json"
     print("=" * 70)
@@ -104,9 +108,15 @@ def run(split: str = "train", max_samples: int = 500, max_tokens: int = 1536,
             samples = json.load(f)["samples"]
         done = {s["id"] for s in samples}
 
+    heads = None
+    if save_heads:  # per-head attention mass, kept aligned with the JSON samples (also across --resume)
+        heads = HeadStore(output.with_suffix(".heads.pt"))
+        if samples:
+            heads.load().align_to([s["id"] for s in samples])
+
     dataset = load_dataset("hotpotqa/hotpot_qa", "distractor", split=split)
     model, tokenizer = load_teacher(teacher, attn_impl=attn_impl)
-    scorer = OracleScorer(model, tokenizer, attn_impl)
+    scorer = OracleScorer(model, tokenizer, attn_impl, keep_heads=save_heads)
     if attn_impl == "eager":
         batch_size = 1
     chunker = MapleIndexer(device="cpu")
@@ -119,8 +129,10 @@ def run(split: str = "train", max_samples: int = 500, max_tokens: int = 1536,
     def save(final: bool = False):
         meta = make_metadata("hotpotqa_distractor", teacher, max_tokens, CHUNK_SIZE, TOP_K,
                              len(samples), split, skipped=dict(skipped), complete=final,
-                             attn_impl=attn_impl, batch_size=batch_size)
+                             attn_impl=attn_impl, batch_size=batch_size, save_heads=save_heads)
         save_json({"metadata": meta, "samples": samples}, output)
+        if heads is not None:
+            heads.save()
 
     def flush():
         nonlocal new_count, last_save
@@ -131,7 +143,9 @@ def run(split: str = "train", max_samples: int = 500, max_tokens: int = 1536,
             if res is None:
                 skipped["oom"] += 1
                 continue
-            last_scores, all_scores = res
+            last_scores, all_scores, *extra = res
+            if heads is not None:
+                heads.add(rec["id"], [b["id"] for b in rec["blocks"]], extra[0])
             ranked = sorted(last_scores.items(), key=lambda x: x[1], reverse=True)
             rec["top_5_block_ids"] = [bid for bid, _ in ranked[:TOP_K]]
             rec["attention_scores"] = {str(k): round(v, 6) for k, v in ranked}
@@ -201,9 +215,11 @@ if __name__ == "__main__":
     p.add_argument("--attn-impl", choices=["fast", "eager"], default="fast",
                    help="fast = SDPA + last-row capture, batched; eager = v0.2.0-style reference")
     p.add_argument("--batch-size", type=int, default=8, help="Prompts per forward pass (fast path)")
+    p.add_argument("--save-heads", action="store_true",
+                   help="Also save per-layer, per-head attention mass per block to <output>.heads.pt (fast path only)")
     a = p.parse_args()
     from scripts.runlog import record_outputs, start_run
     with start_run("oracle", f"hotpot_{a.split}_{a.max_tokens}", vars(a)) as _run:
         out_path = run(a.split, a.max_samples, a.max_tokens, a.teacher, a.resume, a.output,
-                       a.attn_impl, a.batch_size)
+                       a.attn_impl, a.batch_size, a.save_heads)
         record_outputs(_run, out_path, role='oracle')

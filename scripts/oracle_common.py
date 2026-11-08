@@ -126,11 +126,13 @@ class LastRowCapture:
     Context manager: wrap the SDPA attention function so every layer also
     records the head-averaged attention row of the LAST query position.
 
-    ``rows`` gets one ``[batch, key_len]`` float32 CPU tensor per layer.
+    ``rows`` gets one ``[batch, key_len]`` float32 CPU tensor per layer, or with
+    ``keep_heads=True`` one ``[batch, heads, key_len]`` tensor (no head averaging).
     """
 
-    def __init__(self):
+    def __init__(self, keep_heads: bool = False):
         self.rows: List[torch.Tensor] = []
+        self.keep_heads = keep_heads
         self._orig = None
 
     def _wrapper(self, module, query, key, value, attention_mask, *args, **kwargs):
@@ -153,8 +155,8 @@ class LastRowCapture:
                     scores = scores.masked_fill(~m, float("-inf"))
                 else:
                     scores = scores + m.float()
-            probs = torch.softmax(scores, dim=-1).mean(dim=1)[:, 0, :]  # [B, L]
-            self.rows.append(probs.cpu())
+            probs = torch.softmax(scores, dim=-1)[:, :, 0, :]  # [B, H, L]
+            self.rows.append((probs if self.keep_heads else probs.mean(dim=1)).cpu())
         return out
 
     def __enter__(self):
@@ -184,14 +186,17 @@ def score_batch(
     model,
     items: Sequence[Tuple[torch.Tensor, List[Tuple[int, int, int]]]],
     pad_token_id: int,
-) -> List[Tuple[Dict[int, float], Dict[int, float]]]:
+    keep_heads: bool = False,
+) -> List[tuple]:
     """
     Fast path: score several prompts in one left-padded forward pass.
 
     Args:
         items: (input_ids [1, L_i], block_ranges) pairs from build_prompt_with_mapping.
+        keep_heads: also return the per-layer, per-head attention mass of every block.
     Returns:
-        One (last-layer scores, all-layer-mean scores) pair per item.
+        One (last-layer scores, all-layer-mean scores) pair per item; with ``keep_heads`` a triple whose
+        third entry is a float16 tensor ``[layers, heads, n_blocks]`` (blocks in ``block_ranges`` order).
     """
     device = next(model.parameters()).device
     seqs = [ids.reshape(-1) for ids, _ in items]
@@ -210,42 +215,53 @@ def score_batch(
     position_ids = (mask.cumsum(-1) - 1).clamp(min=0)
 
     base = getattr(model, "model", model)  # skip the LM head: only attention is needed
-    with LastRowCapture() as cap:
+    with LastRowCapture(keep_heads=keep_heads) as cap:
         base(input_ids=input_ids.to(device), attention_mask=mask.to(device),
              position_ids=position_ids.to(device), use_cache=False)
     if not cap.rows:
         raise RuntimeError("No attention rows captured; is the teacher using attn_implementation='sdpa'?")
 
-    stacked = torch.stack(cap.rows)  # [layers, B, L]
-    last, mean_all = stacked[-1], stacked.mean(dim=0)
-    return [_aggregate(last[i, p:], mean_all[i, p:], ranges)
-            for i, ((_, ranges), p) in enumerate(zip(items, pads))]
+    stacked = torch.stack(cap.rows)  # [layers, B, L]  or  [layers, B, H, L] with keep_heads
+    if not keep_heads:
+        last, mean_all = stacked[-1], stacked.mean(dim=0)
+        return [_aggregate(last[i, p:], mean_all[i, p:], ranges)
+                for i, ((_, ranges), p) in enumerate(zip(items, pads))]
+    last, mean_all = stacked[-1].mean(dim=1), stacked.mean(dim=(0, 2))  # head-mean of last layer; layer+head mean
+    out = []
+    for i, ((_, ranges), p) in enumerate(zip(items, pads)):
+        last_scores, all_scores = _aggregate(last[i, p:], mean_all[i, p:], ranges)
+        heads = torch.stack([stacked[:, i, :, p + s:p + e].sum(dim=-1) for _, s, e in ranges], dim=-1)
+        out.append((last_scores, all_scores, heads.half()))
+    return out
 
 
-def score_batch_safe(model, items, pad_token_id):
+def score_batch_safe(model, items, pad_token_id, keep_heads: bool = False):
     """score_batch that halves the batch on CUDA OOM; None for items that still OOM alone."""
     try:
-        return score_batch(model, items, pad_token_id)
+        return score_batch(model, items, pad_token_id, keep_heads=keep_heads)
     except torch.cuda.OutOfMemoryError:
         torch.cuda.empty_cache()
         if len(items) == 1:
             return [None]
         mid = len(items) // 2
-        return score_batch_safe(model, items[:mid], pad_token_id) + score_batch_safe(model, items[mid:], pad_token_id)
+        return (score_batch_safe(model, items[:mid], pad_token_id, keep_heads)
+                + score_batch_safe(model, items[mid:], pad_token_id, keep_heads))
 
 
 class OracleScorer:
     """Uniform interface over the fast (batched) and eager (reference) paths."""
 
-    def __init__(self, model, tokenizer, attn_impl: str = "fast"):
-        self.model, self.attn_impl = model, attn_impl
+    def __init__(self, model, tokenizer, attn_impl: str = "fast", keep_heads: bool = False):
+        if keep_heads and attn_impl != "fast":
+            raise ValueError("per-head attention mass (--save-heads) requires --attn-impl fast")
+        self.model, self.attn_impl, self.keep_heads = model, attn_impl, keep_heads
         self.pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
         self.recorder = LastRowAttentionRecorder(model) if attn_impl == "eager" else None
 
     def score(self, items):
         """items: list of (input_ids, block_ranges). Returns a list of score pairs (or None on OOM)."""
         if self.attn_impl == "fast":
-            return score_batch_safe(self.model, items, self.pad_id)
+            return score_batch_safe(self.model, items, self.pad_id, self.keep_heads)
         out = []
         for ids, ranges in items:
             try:
@@ -258,6 +274,48 @@ class OracleScorer:
     def close(self):
         if self.recorder:
             self.recorder.remove()
+
+
+class HeadStore:
+    """Per-sample, per-head attention mass saved next to an oracle JSON (``<stem>.heads.pt``).
+
+    ``mass[id]``: float16 ``[layers, heads, n_blocks]``; ``block_order[id]``: the block ids of its columns
+    (identical to the sample's ``blocks`` order). Contains only tensors / lists / dicts / strings, so it loads
+    with ``weights_only=True``.
+    """
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self.block_order: Dict[str, List[int]] = {}
+        self.mass: Dict[str, torch.Tensor] = {}
+
+    def load(self) -> "HeadStore":
+        if self.path.exists():
+            blob = torch.load(self.path, map_location="cpu", weights_only=True)
+            self.block_order, self.mass = blob["block_order"], blob["mass"]
+        return self
+
+    def add(self, sample_id: str, block_ids: Sequence[int], mass: torch.Tensor) -> None:
+        if mass.shape[-1] != len(block_ids):
+            raise ValueError(f"head mass for {sample_id} has {mass.shape[-1]} columns but {len(block_ids)} blocks")
+        self.block_order[str(sample_id)] = [int(b) for b in block_ids]
+        self.mass[str(sample_id)] = mass
+
+    def align_to(self, sample_ids: Sequence[str]) -> None:
+        """Drop entries for samples not in ``sample_ids`` (an interrupted run); fail if any sample lacks heads."""
+        keep = {str(i) for i in sample_ids}
+        missing = [i for i in sample_ids if str(i) not in self.mass]
+        if missing:
+            raise ValueError(f"{self.path.name} has no heads for {len(missing)} resumed samples "
+                             f"(e.g. {missing[0]}); regenerate this oracle file with --save-heads")
+        self.block_order = {k: v for k, v in self.block_order.items() if k in keep}
+        self.mass = {k: v for k, v in self.mass.items() if k in keep}
+
+    def save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        torch.save({"block_order": self.block_order, "mass": self.mass}, tmp)
+        tmp.replace(self.path)
 
 
 # ===================================================================
