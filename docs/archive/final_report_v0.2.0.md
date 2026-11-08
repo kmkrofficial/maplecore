@@ -1,3 +1,6 @@
+> **Archived (2026-11-08).** Historical document from v0.2.0-beta. Its numbers were produced by code
+> with known bugs (see [../GAPS.md](../GAPS.md)) and are **not reproducible**. Do not cite them.
+
 # MAPLE: Model-Adaptive Projection of Latent Embeddings
 **Final Research Report**
 *Date: 2026-02-12*

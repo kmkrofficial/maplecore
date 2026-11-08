@@ -110,3 +110,8 @@ models/
 research_log.md
 wandb/
 results/
+# Run logs
+logs/
+
+# Keep dependency files despite *.txt above
+!requirements*.txt

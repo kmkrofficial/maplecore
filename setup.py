@@ -11,13 +11,13 @@ setup(
     name="maplecore",
     version="0.2.0-beta",
     author="Keerthi Raajan K M",
-    description="Memory-Aware Predictive Loading Engine for Infinite Context LLMs",
+    description="Experimental learned context selection for long-document LLM QA",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/kmkrworks/maple",
-    packages=find_packages(),
+    url="https://github.com/kmkrofficial/maplecore",
+    packages=find_packages(include=["maplecore", "maplecore.*"]),
     classifiers=[
-        "Development Status :: 4 - Beta",
+        "Development Status :: 3 - Alpha",
         "Intended Audience :: Developers",
         "Intended Audience :: Science/Research",
         "License :: OSI Approved :: MIT License",
@@ -34,7 +34,9 @@ setup(
     ],
     extras_require={
         "benchmarks": [
-            "datasets>=2.14.0",
+            "datasets>=2.19.0",
+            "psutil>=5.9.0",
+            "einops>=0.7.0",
             "transformers>=4.30.0",
             "scikit-learn>=1.3.0",
             "tqdm>=4.65.0",
@@ -54,14 +56,16 @@ setup(
         "production": [
             "onnx>=1.14.0",
             "onnxruntime>=1.15.0",
+            "onnxscript>=0.1.0",
         ],
         "training": [
-            "bitsandbytes>=0.41.0",
-            "accelerate>=0.24.0",
-            "peft>=0.6.0",
+            "transformers>=4.45.0",
+            "bitsandbytes>=0.45.0",
+            "accelerate>=0.30.0",
         ],
         "dev": [
             "pytest>=7.0.0",
+            "ruff>=0.5.0",
             "black>=23.0.0",
             "mypy>=1.0.0",
         ],

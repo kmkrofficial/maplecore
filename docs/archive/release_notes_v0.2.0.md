@@ -1,3 +1,6 @@
+> **Archived (2026-11-08).** Historical document from v0.2.0-beta. Its numbers were produced by code
+> with known bugs (see [../GAPS.md](../GAPS.md)) and are **not reproducible**. Do not cite them.
+
 # MAPLE SDK v0.2.0-beta Release Notes
 
 Welcome to the **v0.2.0-beta** release of the MAPLE library! This massive architectural update refines our inference speeds, supercharges memory retrieval, and stabilizes end-to-end telemetry workflows against comprehensive baseline factual datasets.
