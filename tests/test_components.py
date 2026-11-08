@@ -23,6 +23,14 @@ def test_resolve_device_auto_and_fallback(monkeypatch):
     assert resolve_device("cpu") == "cpu"
 
 
+def test_resolve_device_ignores_cuda_that_reports_no_devices(monkeypatch):
+    """torch can report is_available() while device_count() is 0 (e.g. CUDA_VISIBLE_DEVICES='' on Windows)."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 0)
+    assert resolve_device(None) == "cpu"
+    assert resolve_device("cuda") == "cpu"
+
+
 # -------------------------------------------------------------- indexer
 
 def test_chunk_text_no_overlap_matches_legacy_behaviour():

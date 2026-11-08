@@ -44,7 +44,8 @@ def get_device(prefer_cuda: bool = True) -> torch.device:
     Returns:
         torch.device object
     """
-    if prefer_cuda and torch.cuda.is_available():
+    # is_available() can be True while device_count() is 0 (driver present, no visible device)
+    if prefer_cuda and torch.cuda.is_available() and torch.cuda.device_count() > 0:
         return torch.device("cuda")
     return torch.device("cpu")
 
@@ -60,7 +61,7 @@ def resolve_device(device: Optional[Union[str, torch.device]] = None) -> str:
     if device is None or str(device) == "auto":
         return str(get_device())
     device = str(device)
-    if device.startswith("cuda") and not torch.cuda.is_available():
+    if device.startswith("cuda") and not (torch.cuda.is_available() and torch.cuda.device_count() > 0):
         logging.getLogger(__name__).warning(
             f"Device '{device}' requested but CUDA is unavailable; using CPU."
         )
