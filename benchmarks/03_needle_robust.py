@@ -1,17 +1,30 @@
 #!/usr/bin/env python3
 """
-Benchmark 03: Robustness (Needle-in-a-Haystack)
-===============================================
+Benchmark 03: Needle-in-a-Haystack robustness
+=============================================
 
-Tests the retrieval precision of MAPLE across varying context lengths.
-Inserts a specific "needle" (fact/UUID) into a large "haystack" (filler text)
-at various depths and checks if the correct block is retrieved in the Top-5.
+Inserts a single out-of-place fact ("needle") into real book text
+(Alice in Wonderland, Gutenberg #11, tiled if needed) at a given depth and
+checks whether the block(s) covering the needle are retrieved in the top-k.
 
-Key Features:
-- Safe Insertion: Pads needle with newlines to avoid chunk splitting.
-- Dual Types: UUID (exact) vs Fact (semantic).
-- Visualization: Heatmap of success rates.
+Changes vs v0.2.0 (see docs/GAPS.md D6, C5, B1):
+  * Needle templates are HELD OUT: disjoint from the synthetic training
+    templates in scripts/train_generalist.py.
+  * No padding of the text to chapter boundaries (the search bug it hid is fixed).
+  * N trials per (length, depth) cell with fresh values/templates; success rate
+    reported with a 95% bootstrap CI.
+  * Success = any top-k block overlaps the needle's character span, so a
+    needle split across two fixed-size blocks is still counted.
+  * BM25 and dense baselines alongside MAPLE.
+
+Output: benchmarks/results/needle_robustness.json (+ heatmap per method)
+
+Usage:
+    python benchmarks/03_needle_robust.py
+    python benchmarks/03_needle_robust.py --lengths 10000 100000 1000000 --trials 20
 """
+
+from __future__ import annotations
 
 import argparse
 import json
@@ -19,264 +32,167 @@ import logging
 import random
 import sys
 import uuid
+from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
-import seaborn as sns
 import torch
 
-# Add project root
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from benchmarks.config import DATA_DIR, RESULTS_DIR, NEEDLE_CONTEXT_SIZES, NEEDLE_DEPTHS, MODEL_PATH
-from maplecore import MapleScanner, MapleIndexer, MapleNet
+from benchmarks import metrics as M
+from benchmarks.config import MODEL_PATH, RESULTS_DIR, BGE_MODEL_NAME
+from benchmarks.data_loader import get_gutenberg_books
+from maplecore import MapleIndexer, MapleNet, MapleScanner
+from maplecore.indexer import Index
+from maplecore.utils import _cosine_similarity
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
+CONTEXT_LENGTHS = [10_000, 50_000, 100_000, 500_000]
+DEPTHS = [0, 25, 50, 75, 100]
+CHUNK = 500
+TOP_K = 5
 
-# Use slightly smaller steps if strict 100k is too slow, but user asked for 100k
-CONTEXT_LENGTHS = [10_000, 25_000, 50_000, 100_000] 
-DEPTHS = [0, 25, 50, 75, 100] # Percentages
+# HELD-OUT templates: must not overlap scripts/train_generalist.py TRAIN_NEEDLE_TEMPLATES.
+HELDOUT_TEMPLATES: List[Tuple[str, str]] = [
+    ("The Project MAPLE secret meeting is held in {city} every {day} at {hour} PM.",
+     "Where and when is the secret meeting?"),
+    ("Dr. Whitlock's emergency contact number is {num}.",
+     "What is Dr. Whitlock's emergency contact number?"),
+    ("The rare orchid was last seen growing beside the {city} railway station.",
+     "Where was the rare orchid last seen?"),
+    ("Inventory record {code} lists exactly {num} brass telescopes.",
+     "How many brass telescopes are in the inventory record?"),
+]
+_CITIES = ["Lisbon", "Nairobi", "Osaka", "Winnipeg", "Valparaiso", "Tbilisi"]
+_DAYS = ["Monday", "Wednesday", "Thursday", "Saturday"]
 
-HAYSTACK_FILE = DATA_DIR / "haystack_corpus.txt" # We will generate or load this
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+def _needle(rng: random.Random) -> Tuple[str, str]:
+    template, question = rng.choice(HELDOUT_TEMPLATES)
+    text = template.format(city=rng.choice(_CITIES), day=rng.choice(_DAYS), hour=rng.randint(1, 12),
+                           num=rng.randint(1000, 999999), code=str(uuid.UUID(int=rng.getrandbits(128)))[:8])
+    return text, question
 
-def generate_haystack(length: int) -> str:
-    """
-    Generate a haystack of roughly `length` characters using Alice in Wonderland text.
-    """
-    alices_adventures = (
-        "Alice was beginning to get very tired of sitting by her sister on the bank, and of having nothing to do: "
-        "once or twice she had peeped into the book her sister was reading, but it had no pictures or conversations in it, "
-        "'and what is the use of a book,' thought Alice 'without pictures or conversation?' "
-        "So she was considering in her own mind (as well as she could, for the hot day made her feel very sleepy and stupid), "
-        "whether the pleasure of making a daisy-chain would be worth the trouble of getting up and picking the daisies, "
-        "when suddenly a White Rabbit with pink eyes ran close by her. "
-        "There was nothing so VERY remarkable in that; nor did Alice think it so VERY much out of the way to hear the Rabbit say to itself, "
-        "'Oh dear! Oh dear! I shall be too late!' (when she thought it over afterwards, it occurred to her that she ought to have wondered at this, "
-        "but at the time it all seemed quite natural); but when the Rabbit actually TOOK A WATCH OUT OF ITS WAISTCOAT-POCKET, "
-        "and looked at it, and then hurried on, Alice started to her feet, for it flashed across her mind that she had never before seen a rabbit with either a waistcoat-pocket, or a watch to take out of it, "
-        "and burning with curiosity, she ran across the field after it, and fortunately was just in time to see it pop down a large rabbit-hole under the hedge. "
-    )
-    multiplier = (length // len(alices_adventures)) + 1
-    return (alices_adventures * multiplier)[:length]
 
-def insert_safe_needle(haystack: str, needle: str, depth_percent: int) -> Tuple[str, int]:
-    """
-    Insert needle at specific depth with newline padding.
-    """
-    if depth_percent == 0:
-        insert_idx = 0
-    elif depth_percent == 100:
-        insert_idx = len(haystack)
+def _haystack(length: int) -> str:
+    alice = get_gutenberg_books([11]).get(11)
+    if not alice:
+        raise RuntimeError("Gutenberg #11 unavailable; run scripts/download_data.py --only gutenberg")
+    start = alice.find("CHAPTER I")
+    alice = alice[start if start > 0 else 0:]
+    return (alice * (length // len(alice) + 1))[:length]
+
+
+def _insert(haystack: str, needle: str, depth: int) -> Tuple[str, Tuple[int, int]]:
+    idx = int(len(haystack) * depth / 100)
+    # move to the next sentence end so the needle does not split a word
+    while 0 < idx < len(haystack) and haystack[idx - 1] not in ".!?\n":
+        idx += 1
+    text = haystack[:idx] + " " + needle + " " + haystack[idx:]
+    return text, (idx + 1, idx + 1 + len(needle))
+
+
+def run(lengths: Sequence[int] = CONTEXT_LENGTHS, depths: Sequence[int] = DEPTHS, trials: int = 10,
+        model_path: Optional[Path] = None, embedding_model: str = BGE_MODEL_NAME, seed: int = 0,
+        device: Optional[str] = None) -> dict:
+    from rank_bm25 import BM25Okapi
+
+    rng = random.Random(seed)
+    indexer = MapleIndexer(model_name=embedding_model, device=device)
+    model_path = Path(model_path or MODEL_PATH)
+    scanner = None
+    if model_path.exists():
+        scanner = MapleScanner(MapleNet.load(model_path, device=indexer.device), device=indexer.device)
     else:
-        insert_idx = int(len(haystack) * (depth_percent / 100))
-        
-    # Find nearest space to avoid cutting words
-    while insert_idx < len(haystack) and haystack[insert_idx] != " ":
-        insert_idx += 1
-        
-    # Pad with newlines to force chunk boundaries or at least distinct semantics
-    padded_needle = f"\n\n{needle}\n\n"
-    
-    new_text = haystack[:insert_idx] + padded_needle + haystack[insert_idx:]
-    return new_text, insert_idx
+        logger.warning(f"No MAPLE model at {model_path}; baselines only.")
 
-def get_needle_pair(type_: str) -> Tuple[str, str]:
-    """Return (question, needle_text) for a given type."""
-    if type_ == "uuid":
-        secret_code = str(uuid.uuid4())
-        needle = f"The secret passkey is {secret_code}."
-        question = "What is the secret passkey?"
-        return question, needle
-    else:
-        # Fact
-        city = random.choice(["San Francisco", "New York", "London", "Tokyo", "Berlin"])
-        day = random.choice(["Monday", "Tuesday", "Friday"])
-        time_ = f"{random.randint(1, 12)} PM"
-        needle = f"The Project MAPLE secret meeting is held in {city} every {day} at {time_}."
-        question = "Where and when is the secret meeting?"
-        return question, needle
+    cells = defaultdict(lambda: defaultdict(list))  # (len, depth) -> method -> [0/1]
+    for length in lengths:
+        base = _haystack(length)
+        base_blocks = indexer.chunk_text(base, CHUNK)
+        logger.info(f"length={length:,} chars ({len(base_blocks)} blocks): encoding haystack...")
+        base_emb = indexer.encode_blocks(base_blocks, show_progress=False)
+        for depth in depths:
+            for _ in range(trials):
+                needle, question = _needle(rng)
+                text, (ns, ne) = _insert(base, needle, depth)
+                blocks = indexer.chunk_text(text, CHUNK)
+                hit_ids = {b.id for b in blocks if b.start_char < ne and ns < b.end_char}
+                # Only blocks at/after the insertion point change; reuse the rest
+                # (one block of slack: the leading space may land in the previous block).
+                first = max(0, min(hit_ids) - 1)
+                emb = torch.cat([base_emb[:first], indexer.encode_blocks(blocks[first:], show_progress=False)])
+                index = Index(blocks=blocks, embeddings=emb, chunk_size=CHUNK)
+                q = indexer.encode_query(question)
 
-# ---------------------------------------------------------------------------
-# Benchmark Logic
-# ---------------------------------------------------------------------------
+                rankings: Dict[str, List[int]] = {}
+                sims = _cosine_similarity(q, emb)
+                rankings["dense"] = torch.topk(sims, TOP_K).indices.tolist()
+                bm = BM25Okapi([b.text.lower().split() for b in blocks]).get_scores(question.lower().split())
+                rankings["bm25"] = np.argsort(-bm)[:TOP_K].tolist()
+                if scanner:
+                    for strat in ("linear", "adaptive"):
+                        rankings[f"maple_{strat}"] = scanner.search(q, index, k=TOP_K, strategy=strat).block_ids[:TOP_K]
+                for method, r in rankings.items():
+                    cells[(length, depth)][method].append(float(bool(set(r) & hit_ids)))
+            summary = {m: f"{np.mean(v) * 100:.0f}%" for m, v in cells[(length, depth)].items()}
+            logger.info(f"  depth={depth:>3}%: {summary}")
 
-def run_test(
-    scanner: MapleScanner,
-    context_len: int,
-    depth: int,
-    needle_type: str = "fact"
-) -> bool:
-    """
-    Run a single needle test.
-    
-    Returns: True if needle block is in Top-5 results.
-    """
-    # 1. Prepare Data
-    haystack = generate_haystack(context_len)
-    question, needle = get_needle_pair(needle_type)
-    final_text, _ = insert_safe_needle(haystack, needle, depth)
-    
-    # 2. Index
-    # We use temporary index
-    from maplecore.indexer import MapleIndexer
-    
-    # We need to construct an Index object manually or usage scanner's internal?
-    # Scanner takes `Index` object.
-    # MapleIndexer creates `Index`.
-    
-    # Use indexer from scanner? Scanner doesn't enforce indexer, it takes Index.
-    # We can assume `scanner` has access to embedding model?
-    # Wait, `MapleScanner` uses `self.model` (the MLP).
-    # `MapleIndexer` uses BGE.
-    
-    # We need to embed the text first.
-    # Pad final_text to exact chapter block boundaries to prevent
-    # adaptive search truncation. Chapter size is 100 blocks of 200 chars = 20,000 chars.
-    rem = len(final_text) % 20000
-    if rem != 0:
-        final_text += "." * (20000 - rem)
-
-    indexer = MapleIndexer(device=scanner.device)
-    index = indexer.create_index(final_text, chunk_size=200)
-    
-    # 3. Search
-    # We want to use "adaptive" search as per user request
-    query_emb = indexer.encode_query(question)
-    
-    results = scanner.search(
-        query_emb, 
-        index, 
-        k=5, 
-        strategy="adaptive"
-    )
-    
-    # 4. Verify
-    # Check if any of the result blocks contain the needle text
-    found = False
-    for block_id in results.block_ids:
-        # Access block text from index
-        if 0 <= block_id < len(index.blocks):
-            block_text = index.blocks[block_id].text
-            if needle in block_text:
-                found = True
-                break
-            
-    # Cleanup to save RAM?
-    del index.embeddings
-    del index
-    torch.cuda.empty_cache()
-    
-    return found
-
-def plot_heatmap(results: List[Dict], output_path: Path):
-    """
-    Generate heatmap: Length vs Depth.
-    Differs slightly from request (X=Depth, Y=Length).
-    """
-    # Aggregate data
-    # Structure: [(len, depth, success), ...]
-    
-    lengths = sorted(list(set(r["length"] for r in results)))
-    depths = sorted(list(set(r["depth"] for r in results)))
-    
-    grid = np.zeros((len(lengths), len(depths)))
-    
-    for r in results:
-        l_idx = lengths.index(r["length"])
-        d_idx = depths.index(r["depth"])
-        grid[l_idx, d_idx] = 1.0 if r["success"] else 0.0
-        
-    plt.figure(figsize=(10, 8))
-    ax = sns.heatmap(
-        grid, 
-        xticklabels=depths, 
-        yticklabels=[f"{l//1000}k" for l in lengths],
-        cmap="RdYlGn", 
-        vmin=0, 
-        vmax=1,
-        annot=True,
-        fmt=".1f",
-        linewidths=.5
-    )
-    
-    ax.set_xlabel("Depth (%)")
-    ax.set_ylabel("Context Length (chars)")
-    ax.set_title("Needle-in-a-Haystack Robustness (Success Rate)")
-    
-    plt.tight_layout()
-    plt.savefig(output_path)
-    logger.info(f"Heatmap saved to {output_path}")
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--lengths", type=int, nargs="+", default=CONTEXT_LENGTHS)
-    parser.add_argument("--type", type=str, choices=["uuid", "fact"], default="fact")
-    args = parser.parse_args()
-    
+    methods = sorted({m for c in cells.values() for m in c})
+    out = {
+        "config": {"lengths": list(lengths), "depths": list(depths), "trials": trials, "chunk_size": CHUNK,
+                   "top_k": TOP_K, "templates": "held-out", "model_path": str(model_path) if scanner else None,
+                   "seed": seed},
+        "cells": [{"length": l, "depth": d, **{m: M.summarize(v) for m, v in c.items()}}
+                  for (l, d), c in sorted(cells.items())],
+        "overall": {m: M.summarize([x for c in cells.values() for x in c.get(m, [])]) for m in methods},
+    }
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    
-    # 1. Load Scanner
-    logger.info(f"Loading MAPLE Generalist from {MODEL_PATH}")
-    if not MODEL_PATH.exists():
-        logger.error("Model not found! Run training first.")
-        return
-        
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = MapleNet.load(str(MODEL_PATH), device=device)
-    
-    scanner = MapleScanner(
-        model=model,
-        device=device
-    )
-    
-    results = []
-    
-    # 2. Run Matrix
-    logger.info(f"Starting Benchmark (Type: {args.type})")
-    
-    from benchmarks.profiler import HardwareMonitor, wrap_result
-    
-    all_results = [] # Renamed to avoid conflict with `results` from `run_test`
-    
-    with HardwareMonitor(interval=0.1) as mon:
-        for length in args.lengths:
-            for depth in DEPTHS:
-                logger.info(f"Testing Length={length:,}, Depth={depth}%...")
-                success = run_test(scanner, length, depth, args.type)
-                
-                all_results.append({
-                    "length": length,
-                    "depth": depth,
-                    "success": success,
-                    "type": args.type
-                })
-                
-                status = "PASSED" if success else "FAILED"
-                logger.info(f"  -> {status}")
-            
-    # 3. Save Results
-    final_output = wrap_result(all_results, mon)
-    
-    json_path = RESULTS_DIR / "needle_robustness.json"
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(final_output, f, indent=2)
-        
-    # 4. Plot
-    plot_path = RESULTS_DIR / "needle_heatmap.png"
-    plot_heatmap(all_results, plot_path) # Use all_results for plotting
+    path = RESULTS_DIR / "needle_robustness.json"
+    path.write_text(json.dumps(out, indent=2), encoding="utf-8")
+    _plot(out, methods, RESULTS_DIR)
+    print("\nOverall success@5:")
+    for m, s in out["overall"].items():
+        print(f"  {m:<16} {s['mean'] * 100:5.1f}%  [{s['ci_low'] * 100:.1f}, {s['ci_high'] * 100:.1f}]  n={s['n']}")
+    print(f"Saved -> {path}")
+    return out
+
+
+def _plot(out: dict, methods: List[str], results_dir: Path) -> None:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    lengths, depths = out["config"]["lengths"], out["config"]["depths"]
+    for m in methods:
+        grid = np.full((len(lengths), len(depths)), np.nan)
+        for c in out["cells"]:
+            if m in c:
+                grid[lengths.index(c["length"]), depths.index(c["depth"])] = c[m]["mean"]
+        plt.figure(figsize=(8, 5))
+        sns.heatmap(grid, xticklabels=depths, yticklabels=[f"{l // 1000}k" for l in lengths],
+                    cmap="RdYlGn", vmin=0, vmax=1, annot=True, fmt=".2f")
+        plt.xlabel("Needle depth (%)")
+        plt.ylabel("Haystack length (chars)")
+        plt.title(f"Needle success@{TOP_K} — {m} ({out['config']['trials']} trials/cell)")
+        plt.tight_layout()
+        plt.savefig(results_dir / f"needle_heatmap_{m}.png", dpi=130)
+        plt.close()
+
 
 if __name__ == "__main__":
-    main()
+    p = argparse.ArgumentParser(description="Needle-in-a-Haystack robustness")
+    p.add_argument("--lengths", type=int, nargs="+", default=CONTEXT_LENGTHS)
+    p.add_argument("--depths", type=int, nargs="+", default=DEPTHS)
+    p.add_argument("--trials", type=int, default=10)
+    p.add_argument("--model", type=Path, default=None)
+    p.add_argument("--embedding-model", default=BGE_MODEL_NAME)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--device", default=None)
+    a = p.parse_args()
+    run(a.lengths, a.depths, a.trials, a.model, a.embedding_model, a.seed, a.device)

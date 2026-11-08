@@ -36,8 +36,8 @@ def main():
     
     # Initialize components
     print("\n[2] Loading models...")
-    indexer = MapleIndexer(device="cuda")
-    model = MapleNet.load("maple.pth", device="cuda")
+    indexer = MapleIndexer()
+    model = MapleNet.load("models/maple_generalist.pth")
     
     # Load NarrativeQA
     from datasets import load_dataset
@@ -87,7 +87,7 @@ def main():
         
         # Encode
         query_emb = indexer.encode_query(question)
-        block_embs = indexer.model.encode(blocks, convert_to_tensor=True, device="cuda")
+        block_embs = indexer.model.encode(blocks, convert_to_tensor=True, device=indexer.device)
         
         # RAG: Cosine similarity
         sims = cosine_similarity(query_emb, block_embs)

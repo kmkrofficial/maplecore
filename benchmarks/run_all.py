@@ -28,16 +28,20 @@ logger = logging.getLogger(__name__)
 
 
 BENCHMARKS = {
-    "01": ("Recall@K (NarrativeQA)", "benchmarks.01_recall_narrativeqa"),
-    "02": ("Latency Scaling", "benchmarks.02_latency_scaling"),
-    "03": ("Needle in a Haystack", "benchmarks.03_needle_in_haystack"),
-    "04": ("Cost Analysis", "benchmarks.04_cost_analysis"),
+    # key: (name, module, needs_trained_model)
+    "01": ("Retrieval quality (held-out oracle sets)", "benchmarks.01_recall_enhanced", False),
+    "02": ("Latency scaling", "benchmarks.02_latency_scaling", True),
+    "03": ("Needle in a haystack", "benchmarks.03_needle_robust", False),
+    "04": ("Token / cost reduction", "benchmarks.04_cost_analysis", False),
+    "05": ("Chunk-size ablation", "benchmarks.05_ablation_chunking", True),
+    "07": ("Long-context evidence retrieval", "benchmarks.07_long_context", False),
+    # 06 (E2E generation) needs API keys and is run separately.
 }
 
 
 def run_benchmark(key: str) -> None:
     """Import and run a single benchmark."""
-    name, module_path = BENCHMARKS[key]
+    name, module_path, _ = BENCHMARKS[key]
     print(f"\n{'#' * 70}")
     print(f"# BENCHMARK {key}: {name}")
     print(f"{'#' * 70}\n")
@@ -66,7 +70,7 @@ def main():
     parser = argparse.ArgumentParser(description="MAPLE Benchmark Suite")
     parser.add_argument(
         "--only", type=str, default=None,
-        help="Run only a specific benchmark (e.g., '01', '02', '03', '04')"
+        help="Run only a specific benchmark (e.g., '01', '03', '07')"
     )
     parser.add_argument(
         "--plots-only", action="store_true",

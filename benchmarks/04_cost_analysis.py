@@ -7,7 +7,8 @@ Simulates 100 queries on a book-length document and compares:
   - Full Context: Send entire book to LLM every query
   - MAPLE: Send only Top-5 retrieved blocks + query
 
-Calculates cumulative token cost using GPT-4o and GPT-4o-Mini pricing.
+Primary metric: input-token reduction factor (full book vs top-k blocks).
+Dollar figures use the ILLUSTRATIVE prices in benchmarks/config.py.
 
 Output: results/cost_savings.json
 """
@@ -24,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from benchmarks.config import (
     RESULTS_DIR, PRICING, COST_NUM_QUERIES, CHUNK_SIZE,
 )
-from benchmarks.data_loader import download_gutenberg_book
+from benchmarks.data_loader import get_gutenberg_books
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -48,13 +49,17 @@ def run():
 
     # ---- Load a book ----
     logger.info("Loading test document...")
-    book_text = download_gutenberg_book(1661)  # Sherlock Holmes
+    book_text = get_gutenberg_books([1661]).get(1661)  # Sherlock Holmes
+    if not book_text:
+        raise RuntimeError("Gutenberg #1661 unavailable; run scripts/download_data.py --only gutenberg")
     book_tokens = _estimate_tokens(book_text)
     logger.info(f"Document: {len(book_text):,} chars ~ {book_tokens:,} tokens")
 
     # MAPLE block budget per query
     maple_context_chars = MAPLE_K * CHUNK_SIZE
     maple_context_tokens = _estimate_tokens(str("." * maple_context_chars))
+    reduction = (book_tokens + QUERY_TOKENS) / (maple_context_tokens + QUERY_TOKENS)
+    print(f"Token reduction (full book -> top-{MAPLE_K} blocks): {reduction:.1f}x")
 
     results_all = {}
 
@@ -87,6 +92,8 @@ def run():
 
         results_all[model_name] = {
             "model": model_name,
+            "token_reduction_factor": round(reduction, 2),
+            "prices_are_illustrative": True,
             "book_tokens": book_tokens,
             "maple_context_tokens": maple_context_tokens,
             "num_queries": COST_NUM_QUERIES,
@@ -103,7 +110,7 @@ def run():
         print(f"  Savings:      ${savings:.4f} ({savings_pct:.1f}%)")
 
     # ---- Save primary model results (GPT-4o) for plotting ----
-    primary = results_all.get("gpt-4o", list(results_all.values())[0])
+    primary = list(results_all.values())[0]
     output_path = RESULTS_DIR / "cost_savings.json"
     with open(output_path, "w") as f:
         json.dump(primary, f, indent=2)

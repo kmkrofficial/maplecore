@@ -8,7 +8,7 @@ Measures search latency across increasing index sizes:
 
 Tests Linear, Hierarchical, and Adaptive strategies.
 
-Output: results/latency_scaling.json
+Output: benchmarks/results/latency_results.json
 """
 
 from __future__ import annotations
