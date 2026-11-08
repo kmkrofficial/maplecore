@@ -44,7 +44,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from benchmarks import metrics as M
 from benchmarks.config import MODEL_PATH, RESULTS_DIR, BGE_MODEL_NAME
-from maplecore import MapleIndexer, MapleNet
+from maplecore import MapleIndexer, load_model
 from maplecore.utils import _cosine_similarity
 from scripts.oracle_common import load_oracle_samples
 
@@ -65,7 +65,7 @@ def _bm25_rank(texts: List[str], query: str) -> List[int]:
     return list(np.argsort(-bm25.get_scores(query.lower().split()), kind="stable"))
 
 
-def rank_sample(sample: dict, indexer: MapleIndexer, model: Optional[MapleNet], rng: random.Random) -> Dict[str, List[int]]:
+def rank_sample(sample: dict, indexer: MapleIndexer, model: Optional[torch.nn.Module], rng: random.Random) -> Dict[str, List[int]]:
     """Return {method: ranking of block ids}."""
     ids = [b["id"] for b in sample["blocks"]]
     texts = [b["text"] for b in sample["blocks"]]
@@ -161,7 +161,7 @@ def run(model_path: Optional[Path] = None, embedding_model: str = BGE_MODEL_NAME
     indexer = MapleIndexer(model_name=embedding_model, device=device)
     model = None
     if model_path.exists():
-        model = MapleNet.load(model_path, device=indexer.device)
+        model = load_model(model_path, device=indexer.device)
     else:
         logger.warning(f"No MAPLE model at {model_path}; evaluating baselines only.")
 

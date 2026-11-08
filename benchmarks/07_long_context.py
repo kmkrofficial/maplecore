@@ -48,11 +48,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from benchmarks import metrics as M
 from benchmarks.config import BGE_MODEL_NAME, MODEL_PATH, RESULTS_DIR
-from maplecore import MapleIndexer, MapleNet, MapleScanner
+from maplecore import MapleIndexer, MapleScanner, load_model
 from maplecore.indexer import Block, Index
 from maplecore.utils import _cosine_similarity
 from scripts.generate_oracle_hotpot import flatten_hotpot
-from scripts.oracle_common import answer_block_ids, overlapping_block_ids
+from scripts.oracle_common import answer_block_ids
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
 logger = logging.getLogger(__name__)
@@ -66,7 +66,7 @@ CHUNK = 500
 # ----------------------------------------------------------------- rankers
 
 class Rankers:
-    def __init__(self, indexer: MapleIndexer, model: Optional[MapleNet], chapter_size: int = 100):
+    def __init__(self, indexer: MapleIndexer, model: Optional[torch.nn.Module], chapter_size: int = 100):
         self.indexer = indexer
         self.scanner = MapleScanner(model, device=indexer.device, chapter_size=chapter_size) if model else None
 
@@ -263,7 +263,7 @@ def run(model_path: Optional[Path] = None, embedding_model: str = BGE_MODEL_NAME
         pool_sizes: Sequence[int] = POOL_SIZES, seed: int = 0, device: Optional[str] = None) -> dict:
     model_path = Path(model_path or MODEL_PATH)
     indexer = MapleIndexer(model_name=embedding_model, device=device)
-    model = MapleNet.load(model_path, device=indexer.device) if model_path.exists() else None
+    model = load_model(model_path, device=indexer.device) if model_path.exists() else None
     if model is None:
         logger.warning(f"No MAPLE model at {model_path}; running baselines only.")
     rankers = Rankers(indexer, model)

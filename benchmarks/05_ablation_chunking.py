@@ -38,7 +38,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from benchmarks import metrics as M
 from benchmarks.config import BGE_MODEL_NAME, MODEL_PATH, RESULTS_DIR
-from maplecore import MapleIndexer, MapleNet
+from maplecore import MapleIndexer, load_model
 from maplecore.utils import _cosine_similarity
 from scripts.generate_oracle_hotpot import flatten_hotpot
 from scripts.oracle_common import overlapping_block_ids
@@ -62,7 +62,7 @@ def run(chunk_sizes: Sequence[int] = CHUNK_SIZES, budget_chars: int = 2500, max_
 
     indexer = MapleIndexer(model_name=embedding_model, device=device)
     model_path = Path(model_path or MODEL_PATH)
-    model = MapleNet.load(model_path, device=indexer.device) if model_path.exists() else None
+    model = load_model(model_path, device=indexer.device) if model_path.exists() else None
 
     results = {}
     for size in chunk_sizes:

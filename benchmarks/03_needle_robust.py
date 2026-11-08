@@ -44,7 +44,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from benchmarks import metrics as M
 from benchmarks.config import MODEL_PATH, RESULTS_DIR, BGE_MODEL_NAME
 from benchmarks.data_loader import get_gutenberg_books
-from maplecore import MapleIndexer, MapleNet, MapleScanner
+from maplecore import MapleIndexer, MapleScanner, load_model
 from maplecore.indexer import Index
 from maplecore.utils import _cosine_similarity
 
@@ -106,7 +106,7 @@ def run(lengths: Sequence[int] = CONTEXT_LENGTHS, depths: Sequence[int] = DEPTHS
     model_path = Path(model_path or MODEL_PATH)
     scanner = None
     if model_path.exists():
-        scanner = MapleScanner(MapleNet.load(model_path, device=indexer.device), device=indexer.device)
+        scanner = MapleScanner(load_model(model_path, device=indexer.device), device=indexer.device)
     else:
         logger.warning(f"No MAPLE model at {model_path}; baselines only.")
 
