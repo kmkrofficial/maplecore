@@ -1,10 +1,11 @@
 import pytest
 import torch
 
+from scripts import targets
 from scripts.targets import block_target
 
 
-def _sample(blocks, all_layers=None, last=None, top5=None, gold=None):
+def _sample(blocks, all_layers=None, last=None, top5=None, gold=None, all_layers_calib=None):
     s = {"id": "s", "question": "q", "blocks": [{"id": b, "text": f"b{b}"} for b in blocks],
          "top_5_block_ids": list(top5 if top5 is not None else blocks[:1]),
          "gold_block_ids": list(gold or [])}
@@ -12,6 +13,8 @@ def _sample(blocks, all_layers=None, last=None, top5=None, gold=None):
         s["attention_scores_all_layers"] = all_layers
     if last is not None:
         s["attention_scores"] = last
+    if all_layers_calib is not None:
+        s["attention_scores_all_layers_calib"] = all_layers_calib
     return s
 
 
@@ -61,3 +64,22 @@ def test_ids_outside_blocks_are_ignored():
 def test_unknown_source_raises():
     with pytest.raises(ValueError):
         block_target(_sample(blocks=[0]), "nope")
+
+
+# ------------------------------------------------------------ calibrated / head sources (Tasks 8-9)
+
+def test_calibrated_target_subtracts_content_free_attention():
+    s = _sample(blocks=[0, 1, 2], all_layers={"0": .5, "1": .3, "2": .2}, all_layers_calib={"0": .4, "1": .1, "2": .2})
+    assert torch.allclose(block_target(s, "all_layers_calibrated"), torch.tensor([1 / 3, 2 / 3, 0.0]))
+
+
+def test_calibrated_target_falls_back_and_counts():
+    before = targets.FALLBACKS["all_layers_calibrated"]
+    s = _sample(blocks=[0, 1], all_layers={"0": .5, "1": .5}, all_layers_calib={"0": .6, "1": .6})
+    assert torch.allclose(block_target(s, "all_layers_calibrated"), torch.tensor([.5, .5]))
+    assert targets.FALLBACKS["all_layers_calibrated"] == before + 1
+
+
+def test_calibrated_target_without_calibration_field_falls_back():
+    s = _sample(blocks=[0, 1], all_layers={"0": .2, "1": .6})
+    assert torch.allclose(block_target(s, "all_layers_calibrated"), torch.tensor([.25, .75]))

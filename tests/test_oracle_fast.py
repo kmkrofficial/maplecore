@@ -162,3 +162,40 @@ def test_save_heads_requires_fast_path(tmp_path, monkeypatch):
     monkeypatch.setattr(datasets, "load_dataset", lambda *a, **k: _fake_hotpot(2))
     with pytest.raises(ValueError, match="fast"):
         gen.run(split="validation", max_samples=1, output=tmp_path / "o.json", attn_impl="eager", save_heads=True)
+
+
+# ------------------------------------------------------------ calibration pass (Task 8)
+
+def test_calibration_prompt_keeps_query_block_ranges():
+    from scripts.oracle_common import build_prompt_with_mapping, calibration_prompt
+    from maplecore.indexer import Block
+
+    blocks = [Block(id=i, text=f"block number {i} text") for i in range(6)]
+    tok = _FakeTok()
+    ids_q, ranges_q = build_prompt_with_mapping(blocks, "Who killed the baron of the north tower?", tok, 300)
+    ids_c, ranges_c = calibration_prompt(blocks, ranges_q, "N/A", tok)
+    assert ranges_c == ranges_q                      # same blocks, same token positions
+    assert ids_c.shape[1] < ids_q.shape[1]           # only the question differs (shorter)
+    assert torch.equal(ids_c[0, : ranges_q[-1][2]], ids_q[0, : ranges_q[-1][2]])
+
+
+def test_calibration_fields_and_heads_calib_file(tmp_path, monkeypatch):
+    import datasets
+    from scripts import generate_oracle_hotpot as gen
+    from scripts.oracle_common import load_oracle_samples
+
+    model = _tiny_llama("sdpa")
+    monkeypatch.setattr(gen, "load_teacher", lambda *a, **k: (model, _FakeTok()))
+    monkeypatch.setattr(datasets, "load_dataset", lambda *a, **k: _fake_hotpot(5))
+    monkeypatch.setattr(gen, "CHUNK_SIZE", 20)
+    out = tmp_path / "o.json"
+    gen.run(split="validation", max_samples=3, max_tokens=400, output=out, batch_size=2,
+            save_heads=True, calibration_query="N/A")
+    samples = load_oracle_samples(out)
+    assert len(samples) == 3
+    for s in samples:
+        assert set(s["attention_scores_calib"]) == set(s["attention_scores"])
+        assert set(s["attention_scores_all_layers_calib"]) == set(s["attention_scores_all_layers"])
+    main = torch.load(out.with_suffix(".heads.pt"), weights_only=True)
+    calib = torch.load(out.with_suffix(".heads_calib.pt"), weights_only=True)
+    assert list(calib["mass"]) == list(main["mass"]) and calib["block_order"] == main["block_order"]

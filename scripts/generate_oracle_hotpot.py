@@ -29,11 +29,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from maplecore.indexer import MapleIndexer
+from maplecore.indexer import Block, MapleIndexer
 from scripts.oracle_common import (
     DEFAULT_TEACHER,
     HeadStore,
     OracleScorer,
+    calibration_prompt,
     build_prompt_with_mapping,
     load_teacher,
     make_metadata,
@@ -85,7 +86,8 @@ def flatten_hotpot(item: dict):
 
 def run(split: str = "train", max_samples: int = 500, max_tokens: int = 1536,
         teacher: str = DEFAULT_TEACHER, resume: bool = False, output: Path | None = None,
-        attn_impl: str = "fast", batch_size: int = 8, save_heads: bool = False) -> Path:
+        attn_impl: str = "fast", batch_size: int = 8, save_heads: bool = False,
+        calibration_query: str | None = None) -> Path:
     from datasets import load_dataset
 
     if save_heads and attn_impl != "fast":
@@ -113,6 +115,14 @@ def run(split: str = "train", max_samples: int = 500, max_tokens: int = 1536,
         heads = HeadStore(output.with_suffix(".heads.pt"))
         if samples:
             heads.load().align_to([s["id"] for s in samples])
+    heads_calib = None
+    if calibration_query:  # ICR-style calibration pass: same blocks, content-free question
+        if any("attention_scores_calib" not in s for s in samples):
+            raise ValueError("cannot resume with --calibration-query: existing samples were generated without it")
+        if save_heads:
+            heads_calib = HeadStore(output.with_suffix(".heads_calib.pt"))
+            if samples:
+                heads_calib.load().align_to([s["id"] for s in samples])
 
     dataset = load_dataset("hotpotqa/hotpot_qa", "distractor", split=split)
     model, tokenizer = load_teacher(teacher, attn_impl=attn_impl)
@@ -129,23 +139,36 @@ def run(split: str = "train", max_samples: int = 500, max_tokens: int = 1536,
     def save(final: bool = False):
         meta = make_metadata("hotpotqa_distractor", teacher, max_tokens, CHUNK_SIZE, TOP_K,
                              len(samples), split, skipped=dict(skipped), complete=final,
-                             attn_impl=attn_impl, batch_size=batch_size, save_heads=save_heads)
+                             attn_impl=attn_impl, batch_size=batch_size, save_heads=save_heads, calibration_query=calibration_query)
         save_json({"metadata": meta, "samples": samples}, output)
         if heads is not None:
             heads.save()
+        if heads_calib is not None:
+            heads_calib.save()
 
     def flush():
         nonlocal new_count, last_save
         if not pending:
             return
         results = scorer.score([(ids, ranges) for _, ids, ranges in pending])
-        for (rec, ids, ranges), res in zip(pending, results):
-            if res is None:
+        calib_results = [None] * len(pending)
+        if calibration_query:
+            calib_results = scorer.score([
+                calibration_prompt([Block(b["id"], b["text"]) for b in rec["blocks"]], ranges, calibration_query, tokenizer)
+                for rec, _, ranges in pending])
+        for (rec, ids, ranges), res, cres in zip(pending, results, calib_results):
+            if res is None or (calibration_query and cres is None):
                 skipped["oom"] += 1
                 continue
             last_scores, all_scores, *extra = res
             if heads is not None:
                 heads.add(rec["id"], [b["id"] for b in rec["blocks"]], extra[0])
+            if calibration_query:
+                c_last, c_all, *c_extra = cres
+                rec["attention_scores_calib"] = {str(k): round(v, 6) for k, v in c_last.items()}
+                rec["attention_scores_all_layers_calib"] = {str(k): round(v, 6) for k, v in c_all.items()}
+                if heads_calib is not None:
+                    heads_calib.add(rec["id"], [b["id"] for b in rec["blocks"]], c_extra[0])
             ranked = sorted(last_scores.items(), key=lambda x: x[1], reverse=True)
             rec["top_5_block_ids"] = [bid for bid, _ in ranked[:TOP_K]]
             rec["attention_scores"] = {str(k): round(v, 6) for k, v in ranked}
@@ -215,11 +238,13 @@ if __name__ == "__main__":
     p.add_argument("--attn-impl", choices=["fast", "eager"], default="fast",
                    help="fast = SDPA + last-row capture, batched; eager = v0.2.0-style reference")
     p.add_argument("--batch-size", type=int, default=8, help="Prompts per forward pass (fast path)")
+    p.add_argument("--calibration-query", default=None,
+                   help="Also score every prompt with this content-free question (e.g. \"N/A\") for calibration")
     p.add_argument("--save-heads", action="store_true",
                    help="Also save per-layer, per-head attention mass per block to <output>.heads.pt (fast path only)")
     a = p.parse_args()
     from scripts.runlog import record_outputs, start_run
     with start_run("oracle", f"hotpot_{a.split}_{a.max_tokens}", vars(a)) as _run:
         out_path = run(a.split, a.max_samples, a.max_tokens, a.teacher, a.resume, a.output,
-                       a.attn_impl, a.batch_size, a.save_heads)
+                       a.attn_impl, a.batch_size, a.save_heads, a.calibration_query)
         record_outputs(_run, out_path, role='oracle')

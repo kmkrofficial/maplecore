@@ -356,6 +356,22 @@ def build_prompt_with_mapping(
     return input_ids, block_ranges
 
 
+def calibration_prompt(blocks: Sequence, block_ranges: Sequence[Tuple[int, int, int]], question: str,
+                       tokenizer) -> Tuple[torch.Tensor, List[Tuple[int, int, int]]]:
+    """Prompt with the SAME blocks as a scored sample but a content-free ``question`` (e.g. "N/A").
+
+    Everything before the question is identical, so the block token ranges are identical to
+    ``block_ranges`` (verified); only the tail differs. Scoring it gives the attention each block receives
+    regardless of the question - the bias that calibration removes (ICR, Chen et al. 2025).
+    """
+    keep = {bid for bid, _, _ in block_ranges}
+    chosen = [b for b in blocks if b.id in keep]
+    ids, ranges = build_prompt_with_mapping(chosen, question, tokenizer, max_tokens=10 ** 9)
+    if list(ranges) != list(block_ranges):
+        raise ValueError("calibration prompt changed the block token ranges (tokenizer not prefix-stable?)")
+    return ids, ranges
+
+
 @torch.no_grad()
 def block_attention(
     model,

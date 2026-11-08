@@ -12,16 +12,23 @@ Sources:
     all_layers  teacher attention averaged over all layers (``attention_scores_all_layers``)
     top5        uniform over the oracle's top-5 blocks
     gold        uniform over dataset-evidence blocks (``gold_block_ids``)
-Later tasks add ``all_layers_calibrated`` and ``heads``.
+    all_layers_calibrated  all-layer attention minus the attention the same prompt gets with a
+                content-free question (ICR-style calibration), floored at 0; falls back to
+                ``all_layers`` (and counts it in ``FALLBACKS``) when the calibration is missing or
+                removes all mass
+A later task adds ``heads``.
 """
 
 from __future__ import annotations
 
+from collections import Counter
 from typing import Optional, Sequence, Tuple
 
 import torch
 
-SOURCES = ("last", "all_layers", "top5", "gold")
+SOURCES = ("last", "all_layers", "top5", "gold", "all_layers_calibrated")
+# how often a source had to fall back to another one (reported by the training scripts)
+FALLBACKS: Counter = Counter()
 
 
 def _mass_target(sample: dict, field: str, temperature: float) -> Optional[torch.Tensor]:
@@ -57,6 +64,17 @@ def block_target(
     if source == "last":
         return _mass_target(sample, "attention_scores", temperature)
     if source == "all_layers":
+        return _mass_target(sample, "attention_scores_all_layers", temperature)
+    if source == "all_layers_calibrated":
+        scores = sample.get("attention_scores_all_layers")
+        calib = sample.get("attention_scores_all_layers_calib")
+        if scores and calib:
+            mass = torch.tensor([max(float(scores.get(str(b["id"]), 0.0)) - float(calib.get(str(b["id"]), 0.0)), 0.0)
+                                 for b in sample["blocks"]], dtype=torch.float32)
+            if mass.max() > 0:
+                mass = mass ** (1.0 / temperature)
+                return mass / mass.sum()
+        FALLBACKS["all_layers_calibrated"] += 1
         return _mass_target(sample, "attention_scores_all_layers", temperature)
     if source == "top5":
         return _uniform_target(sample, sample.get("top_5_block_ids", []))
