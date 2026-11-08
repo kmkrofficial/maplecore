@@ -52,6 +52,8 @@ ENCODERS = [
     "nomic-ai/nomic-embed-text-v1.5",
 ]
 TEACHER = "meta-llama/Meta-Llama-3-8B-Instruct"
+RERANKERS = ["BAAI/bge-reranker-base"]
+BEIR_DATASETS = ["scifact", "nfcorpus", "fiqa", "trec-covid"]
 
 
 def _load_manifest() -> dict:
@@ -103,6 +105,31 @@ def download_encoders(manifest: dict) -> None:
     _save_manifest(manifest)
 
 
+def download_rerankers(manifest: dict) -> None:
+    from huggingface_hub import snapshot_download
+
+    for name in RERANKERS:
+        logger.info(f"[reranker] {name}")
+        path = snapshot_download(name, allow_patterns=["*.json", "*.safetensors", "*.model", "*.txt"])
+        if not list(Path(path).glob("*.safetensors")):
+            raise RuntimeError(f"No .safetensors weights in {path}; retry: hf download {name}")
+        manifest.setdefault("rerankers", {})[name] = {"path": path}
+    _save_manifest(manifest)
+
+
+def download_beir(manifest: dict) -> None:
+    from huggingface_hub import hf_hub_download
+
+    for name in BEIR_DATASETS:
+        logger.info(f"[beir] {name}")
+        files = {}
+        files["corpus"] = hf_hub_download(f"BeIR/{name}", "corpus/corpus-00000-of-00001.parquet", repo_type="dataset")
+        files["queries"] = hf_hub_download(f"BeIR/{name}", "queries/queries-00000-of-00001.parquet", repo_type="dataset")
+        files["qrels"] = hf_hub_download(f"BeIR/{name}-qrels", "test.tsv", repo_type="dataset")
+        manifest.setdefault("beir", {})[name] = {k: str(Path(v).stat().st_size) for k, v in files.items()}
+    _save_manifest(manifest)
+
+
 def download_teacher(manifest: dict) -> None:
     from huggingface_hub import snapshot_download
 
@@ -124,7 +151,7 @@ def download_teacher(manifest: dict) -> None:
 def main():
     p = argparse.ArgumentParser(description="Download MAPLE data")
     p.add_argument("--only", nargs="+", default=None,
-                   choices=list(HF_DATASETS) + ["gutenberg", "encoders", "teacher"])
+                   choices=list(HF_DATASETS) + ["gutenberg", "encoders", "teacher", "rerankers", "beir"])
     p.add_argument("--teacher", action="store_true", help="Also download the gated teacher LLM")
     a = p.parse_args()
 
@@ -142,6 +169,10 @@ def main():
                 download_encoders(manifest)
             elif t == "teacher":
                 download_teacher(manifest)
+            elif t == "rerankers":
+                download_rerankers(manifest)
+            elif t == "beir":
+                download_beir(manifest)
         except Exception as e:  # keep going; report at the end
             logger.error(f"{t} failed: {e}")
             failures[t] = str(e)

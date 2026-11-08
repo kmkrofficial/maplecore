@@ -36,6 +36,9 @@ setup(
         "benchmarks": [
             "datasets>=2.19.0",
             "psutil>=5.9.0",
+            "bm25s>=0.2.0",
+            "rouge-score>=0.1.2",
+            "nltk>=3.8",
             "einops>=0.7.0",
             "transformers>=4.30.0",
             "scikit-learn>=1.3.0",
