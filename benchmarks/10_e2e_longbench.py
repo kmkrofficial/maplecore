@@ -156,10 +156,15 @@ class Reader:
         import torch
 
         texts = [self._chat(p, max_len) for p in prompts]
-        order = sorted(range(len(texts)), key=lambda i: -len(texts[i]))
+        lens = [len(self.tok.encode(t, add_special_tokens=False)) for t in texts]
+        order = sorted(range(len(texts)), key=lambda i: -lens[i])
         out = [""] * len(texts)
-        for s in range(0, len(order), batch_size):
-            idx = order[s:s + batch_size]
+        s = 0
+        while s < len(order):
+            # keep the (batch x L x L x heads) attention working set around 3 GB: long prompts run one at a time
+            b = max(1, min(batch_size, int(3e9 // (64 * lens[order[s]] ** 2))))
+            idx = order[s:s + b]
+            s += b
             enc = self.tok([texts[i] for i in idx], return_tensors="pt", padding=True, add_special_tokens=False)
             enc = {k: v.to(self.model.device) for k, v in enc.items()}
             with torch.no_grad():
