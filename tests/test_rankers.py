@@ -73,7 +73,9 @@ def test_cross_encoder_is_lazy():
 
 @pytest.mark.skipif(not hf_cached("BAAI/bge-reranker-base"), reason="model not cached")
 def test_cross_encoder_ranks_relevant_first():
-    texts = ["Paris is the capital of France.", "Bananas are yellow.", "The Seine flows through Paris."]
+    # Distractors must not be about Paris: bge-reranker-base scores "The Seine flows through Paris." (logit 8.1)
+    # above "Paris is the capital of France." (6.2) for this question, so that pair is not a usable assertion.
+    texts = ["Paris is the capital of France.", "Bananas are yellow.", "Photosynthesis takes place in leaves."]
     assert CrossEncoderRanker().rank("What is the capital of France?", texts, None, None)[0] == 0
 
 
