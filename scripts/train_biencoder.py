@@ -36,6 +36,38 @@ from scripts.targets import block_target
 logger = logging.getLogger(__name__)
 
 
+def listwise_batch(q: torch.Tensor, blocks: torch.Tensor, sizes: Sequence[int], targets: Sequence[torch.Tensor],
+                   cross_negatives: bool = False):
+    """Score rows for listwise KL. ``q`` (B, d) and ``blocks`` (sum(sizes), d) are unit-norm; question i owns
+    ``sizes[i]`` consecutive blocks with soft target ``targets[i]``.
+
+    * ``cross_negatives=False``: row i holds only its own blocks (padded to max(sizes), masked).
+    * ``cross_negatives=True``: row i scores every block in the batch; other questions' blocks are negatives with
+      target 0, so the encoder must also separate documents, not only blocks inside one document.
+    Returns (scores, target, mask)."""
+    device = q.device
+    if cross_negatives:
+        scores = q @ blocks.T
+        target = torch.zeros_like(scores)
+        mask = torch.ones_like(scores, dtype=torch.bool)
+        offset = 0
+        for i, n in enumerate(sizes):
+            target[i, offset:offset + n] = targets[i].to(device)
+            offset += n
+        return scores, target, mask
+    n_max = max(sizes)
+    scores = torch.zeros(len(sizes), n_max, device=device, dtype=q.dtype)
+    target = torch.zeros(len(sizes), n_max, device=device)
+    mask = torch.zeros(len(sizes), n_max, dtype=torch.bool, device=device)
+    offset = 0
+    for i, n in enumerate(sizes):
+        scores[i, :n] = blocks[offset:offset + n] @ q[i]
+        target[i, :n] = targets[i].to(device)
+        mask[i, :n] = True
+        offset += n
+    return scores, target, mask
+
+
 def distill_biencoder(
     base_model: str,
     train_oracles: Sequence[Path],
@@ -50,6 +82,7 @@ def distill_biencoder(
     device: Optional[str] = None,
     temperature: float = 1.0,
     cache_folder: Optional[str] = None,
+    cross_negatives: bool = False,
 ) -> dict:
     """Fine-tune ``base_model`` on teacher-attention targets and save it to ``output_dir``."""
     from sentence_transformers import SentenceTransformer
@@ -90,17 +123,8 @@ def distill_biencoder(
             chunk = [groups[i] for i in order[start:start + batch_questions]]
             q = torch.nn.functional.normalize(embed([prefix + g[0] for g in chunk]), dim=-1)
             all_blocks = torch.nn.functional.normalize(embed([t for g in chunk for t in g[1]]), dim=-1)
-            n_max = max(len(g[1]) for g in chunk)
-            scores = torch.full((len(chunk), n_max), 0.0, device=device)
-            target = torch.zeros(len(chunk), n_max, device=device)
-            mask = torch.zeros(len(chunk), n_max, dtype=torch.bool, device=device)
-            offset = 0
-            for i, g in enumerate(chunk):
-                n = len(g[1])
-                scores[i, :n] = all_blocks[offset:offset + n] @ q[i]
-                target[i, :n] = g[2].to(device)
-                mask[i, :n] = True
-                offset += n
+            scores, target, mask = listwise_batch(q, all_blocks, [len(g[1]) for g in chunk],
+                                                  [g[2] for g in chunk], cross_negatives)
             loss = listwise_kl_loss(scores, target, mask, tau=tau)
             opt.zero_grad()
             loss.backward()
@@ -115,7 +139,7 @@ def distill_biencoder(
     model.save(str(output_dir))
     return {"base_model": base_model, "output_dir": str(output_dir).replace("\\", "/"), "epochs": epochs,
             "loss": epoch_loss, "groups": len(groups), "target_source": target_source, "tau": tau, "lr": lr,
-            "seed": seed, "batch_questions": batch_questions}
+            "seed": seed, "batch_questions": batch_questions, "cross_negatives": cross_negatives}
 
 
 def main(argv: Optional[List[str]] = None) -> dict:
@@ -132,10 +156,13 @@ def main(argv: Optional[List[str]] = None) -> dict:
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--max-samples", type=int, default=None)
     p.add_argument("--device", default=None)
+    p.add_argument("--cross-negatives", action="store_true",
+                   help="also score the other questions' blocks in each batch as zero-target negatives")
     a = p.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
     out = distill_biencoder(a.base_model, a.train_oracles, a.output, a.target_source, a.epochs, a.lr,
-                            a.batch_questions, a.tau, a.seed, a.max_samples, a.device, a.temperature)
+                            a.batch_questions, a.tau, a.seed, a.max_samples, a.device, a.temperature,
+                            cross_negatives=a.cross_negatives)
     print(f"saved {out['output_dir']} (final loss {out['loss'][-1]:.4f})")
     return out
 

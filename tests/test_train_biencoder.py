@@ -73,3 +73,41 @@ def test_distill_rejects_degenerate_only_data(tmp_path):
     oracle.write_text(json.dumps(raw), encoding="utf-8")
     with pytest.raises(ValueError, match="usable"):
         distill_biencoder(BASE, [oracle], tmp_path / "enc", epochs=1, device="cpu", cache_folder=str(REPO_CACHE))
+
+
+def _toy_batch():
+    torch.manual_seed(0)
+    q = torch.nn.functional.normalize(torch.randn(2, 4), dim=-1)
+    blocks = torch.nn.functional.normalize(torch.randn(5, 4), dim=-1)  # question 0 owns 3 blocks, question 1 owns 2
+    targets = [torch.tensor([0.7, 0.2, 0.1]), torch.tensor([0.4, 0.6])]
+    return q, blocks, [3, 2], targets
+
+
+def test_listwise_batch_within_document_scores_only_own_blocks():
+    from scripts.train_biencoder import listwise_batch
+
+    q, blocks, sizes, targets = _toy_batch()
+    scores, target, mask = listwise_batch(q, blocks, sizes, targets, cross_negatives=False)
+    assert scores.shape == (2, 3) and mask.tolist() == [[True, True, True], [True, True, False]]
+    assert torch.allclose(scores[1, :2], blocks[3:5] @ q[1])
+    assert torch.allclose(target[0], targets[0]) and target[1, 2] == 0
+
+
+def test_listwise_batch_cross_negatives_scores_every_block_with_zero_target_outside_own_span():
+    from scripts.train_biencoder import listwise_batch
+
+    q, blocks, sizes, targets = _toy_batch()
+    scores, target, mask = listwise_batch(q, blocks, sizes, targets, cross_negatives=True)
+    assert scores.shape == (2, 5) and bool(mask.all())
+    assert torch.allclose(scores, q @ blocks.T)
+    assert torch.allclose(target[0], torch.tensor([0.7, 0.2, 0.1, 0.0, 0.0]))
+    assert torch.allclose(target[1], torch.tensor([0.0, 0.0, 0.0, 0.4, 0.6]))
+
+
+def test_distill_with_cross_negatives_records_the_setting(tmp_path):
+    from scripts.train_biencoder import distill_biencoder
+
+    oracle = _write_oracle_texts(tmp_path, 8)
+    out = distill_biencoder(BASE, [oracle], tmp_path / "enc", epochs=1, max_samples=8, device="cpu",
+                            batch_questions=4, cache_folder=str(REPO_CACHE), cross_negatives=True)
+    assert out["cross_negatives"] is True and (tmp_path / "enc").exists()
