@@ -34,12 +34,50 @@ def _top(order: Sequence[int], k: Optional[int]) -> List[int]:
 
 
 class BM25Ranker:
+    """BM25 with Lucene-style tokenisation (bm25s: lower-case, punctuation stripped, English stop-words).
+
+    Unfitted, it re-ranks the candidates using statistics of the candidates alone (IDF over e.g. a top-100 list,
+    where every candidate matches the query, is nearly flat). After ``fit(corpus)`` it scores candidates with the
+    corpus-level statistics, as a real BM25 index would; candidate texts that are not in the fitted corpus fall
+    back to local scoring."""
+
     name = "bm25"
 
+    def __init__(self):
+        self._index = None
+        self._pos = {}
+
+    @staticmethod
+    def _tok(texts):
+        import bm25s
+        return bm25s.tokenize(list(texts), stopwords="en", show_progress=False)
+
+    @staticmethod
+    def _query_tokens(question):
+        import bm25s
+        return bm25s.tokenize([question], stopwords="en", show_progress=False, return_ids=False)[0]
+
+    def fit(self, corpus_texts: Sequence[str]) -> "BM25Ranker":
+        import bm25s
+        corpus_texts = list(corpus_texts)
+        self._index = bm25s.BM25()
+        self._index.index(self._tok(corpus_texts), show_progress=False)
+        self._pos = {}
+        for i, t in enumerate(corpus_texts):
+            self._pos.setdefault(t, i)
+        return self
+
     def rank(self, question, texts, q_emb=None, block_embs=None, k=None, sample=None) -> List[int]:
-        from rank_bm25 import BM25Okapi
-        bm25 = BM25Okapi([t.lower().split() for t in texts])
-        scores = bm25.get_scores(question.lower().split())
+        import bm25s
+        q = self._query_tokens(question)
+        texts = list(texts)
+        if self._index is not None and all(t in self._pos for t in texts):
+            full = self._index.get_scores(q) if q else np.zeros(len(self._pos))
+            scores = np.asarray(full)[[self._pos[t] for t in texts]]
+        else:
+            local = bm25s.BM25()
+            local.index(self._tok(texts), show_progress=False)
+            scores = np.asarray(local.get_scores(q)) if q else np.zeros(len(texts))
         return _top(np.argsort(-scores, kind="stable"), k)
 
 
@@ -74,6 +112,10 @@ class HybridRRFRanker:
         self.name = "hybrid"
         self.rrf_k = rrf_k
         self._bm25, self._dense = BM25Ranker(), dense or DenseRanker()
+
+    def fit(self, corpus_texts: Sequence[str]) -> "HybridRRFRanker":
+        self._bm25.fit(corpus_texts)
+        return self
 
     def _fuse(self, rankings: Sequence[Sequence[int]]) -> List[int]:
         scores: Dict[int, float] = {}
@@ -131,6 +173,14 @@ class TeacherRanker:
             raise ValueError(f"TeacherRanker needs a sample with '{self.field}'")
         scores = [float(sample[self.field].get(str(b["id"]), 0.0)) for b in sample["blocks"]]
         return _top(np.argsort(-np.asarray(scores), kind="stable"), k)
+
+
+def fit_rankers(rankers: Sequence[Ranker], corpus_texts: Sequence[str]) -> None:
+    """Give corpus-level statistics to every ranker that can use them (BM25, and the BM25 inside hybrid)."""
+    corpus_texts = list(corpus_texts)
+    for r in rankers:
+        if hasattr(r, "fit"):
+            r.fit(corpus_texts)
 
 
 def build_rankers(spec: Sequence[str], model_paths: Optional[Dict[str, object]] = None) -> List[Ranker]:

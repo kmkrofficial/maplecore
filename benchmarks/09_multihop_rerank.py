@@ -33,7 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from benchmarks import metrics as M
 from benchmarks.config import BGE_MODEL_NAME, RESULTS_DIR
-from benchmarks.rankers import build_rankers
+from benchmarks.rankers import build_rankers, fit_rankers
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +109,7 @@ def load_hipporag(stem: str):
 def evaluate(questions: Sequence[dict], corpus: Sequence[dict], rankers: Sequence, indexer,
              first_stage_k: int = 20, first_stage_file: Optional[Dict[str, List[int]]] = None) -> dict:
     texts = [f"{p['title']}\n{p['text']}" for p in corpus]
+    fit_rankers(rankers, texts)  # BM25 / hybrid use corpus-level IDF
     emb = indexer.encode_texts(texts, show_progress=True)
     emb_n = torch.nn.functional.normalize(emb.float(), dim=1)
     per: Dict[str, Dict[str, list]] = {"first_stage": {}}

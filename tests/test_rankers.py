@@ -75,3 +75,40 @@ def test_cross_encoder_is_lazy():
 def test_cross_encoder_ranks_relevant_first():
     texts = ["Paris is the capital of France.", "Bananas are yellow.", "The Seine flows through Paris."]
     assert CrossEncoderRanker().rank("What is the capital of France?", texts, None, None)[0] == 0
+
+
+def test_bm25_ignores_punctuation_and_case():
+    texts = ["Bread is baked from flour.", "We saw a ZEBRA.", "Rain fell over the harbour."]
+    assert BM25Ranker().rank("zebra", texts, None, None)[0] == 1
+
+
+def test_bm25_fitted_on_corpus_ranks_candidates_by_corpus_level_scores():
+    import bm25s
+    import numpy as np
+
+    corpus = ["alpha beta gamma", "alpha alpha delta", "alpha epsilon", "beta zeta eta", "theta iota",
+              "kappa lambda", "mu nu alpha", "xi omicron"]
+    ranker = BM25Ranker()
+    ranker.fit(corpus)
+    candidates = [corpus[2], corpus[0], corpus[1]]  # every candidate contains 'alpha'
+    order = ranker.rank("alpha beta", candidates, None, None)
+
+    ref = bm25s.BM25()
+    ref.index(bm25s.tokenize(corpus, stopwords="en", show_progress=False), show_progress=False)
+    full = ref.get_scores(["alpha", "beta"])
+    expected = list(np.argsort(-full[[2, 0, 1]], kind="stable"))
+    assert order == expected and order[0] == 1  # 'alpha beta gamma' wins on corpus statistics
+
+
+def test_bm25_fitted_falls_back_to_local_scoring_for_unseen_texts():
+    ranker = BM25Ranker()
+    ranker.fit(["alpha beta", "gamma delta"])
+    assert ranker.rank("zebra", ["no match here", "a zebra appears"], None, None)[0] == 1
+
+
+def test_fit_rankers_fits_bm25_and_the_bm25_inside_hybrid():
+    from benchmarks.rankers import fit_rankers
+
+    bm25, hybrid, dense = BM25Ranker(), HybridRRFRanker(), DenseRanker()
+    fit_rankers([bm25, hybrid, dense], ["alpha beta", "gamma delta"])
+    assert bm25._index is not None and hybrid._bm25._index is not None

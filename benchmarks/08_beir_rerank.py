@@ -32,7 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from benchmarks import metrics as M
 from benchmarks.config import BGE_MODEL_NAME, RESULTS_DIR
-from benchmarks.rankers import build_rankers
+from benchmarks.rankers import build_rankers, fit_rankers
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +85,7 @@ def evaluate_rerank(corpus: Dict[str, dict], queries: Dict[str, str], qrels: Dic
     corpus_ids = list(corpus)
     corpus_texts = [_doc_text(corpus[d]) for d in corpus_ids]
     first = bm25_first_stage(corpus_ids, corpus_texts, [queries[q] for q in qids], first_stage_k)
+    fit_rankers(rankers, corpus_texts)  # BM25 / hybrid re-rank with corpus-level IDF, not top-k-local IDF
 
     scores: Dict[str, List[Optional[float]]] = {"_first_stage:bm25": []}
     for r in rankers:
