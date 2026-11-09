@@ -213,3 +213,32 @@ def test_answer_block_ids_normalises():
     blocks = [Block(0, "He went to The Tower of London."), Block(1, "Nothing here.")]
     assert answer_block_ids(blocks, ["the tower of london"]) == [0]
     assert answer_block_ids(blocks, ["a"]) == []  # too short after normalisation
+
+
+def test_limit_gpu_memory_caps_the_allocator_on_cuda(monkeypatch):
+    import torch
+    from maplecore.utils import limit_gpu_memory
+
+    calls = []
+    monkeypatch.setattr(torch.cuda, "set_per_process_memory_fraction", lambda f, d=None: calls.append((f, d)))
+    assert limit_gpu_memory(0.8, "cuda") is True
+    assert calls == [(0.8, 0)]
+
+
+def test_limit_gpu_memory_is_a_no_op_on_cpu_or_without_a_fraction(monkeypatch):
+    import torch
+    from maplecore.utils import limit_gpu_memory
+
+    calls = []
+    monkeypatch.setattr(torch.cuda, "set_per_process_memory_fraction", lambda f, d=None: calls.append(f))
+    assert limit_gpu_memory(0.8, "cpu") is False
+    assert limit_gpu_memory(None, "cuda") is False
+    assert calls == []
+
+
+def test_limit_gpu_memory_rejects_out_of_range_fraction():
+    import pytest
+    from maplecore.utils import limit_gpu_memory
+
+    with pytest.raises(ValueError):
+        limit_gpu_memory(1.5, "cuda")

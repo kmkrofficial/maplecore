@@ -69,6 +69,24 @@ def resolve_device(device: Optional[Union[str, torch.device]] = None) -> str:
     return device
 
 
+def limit_gpu_memory(fraction: Optional[float], device: Optional[Union[str, torch.device]] = None) -> bool:
+    """Cap this process's CUDA allocator at ``fraction`` of the GPU's memory.
+
+    On Windows (WDDM) a process that outgrows dedicated VRAM is silently paged into shared system memory, which
+    makes it many times slower instead of failing. With a cap, PyTorch frees its cache and retries before
+    exceeding it (and raises OOM rather than spilling). No-op on CPU or when ``fraction`` is None.
+    Returns True when a cap was applied."""
+    if fraction is None:
+        return False
+    if not 0.0 < fraction <= 1.0:
+        raise ValueError(f"memory fraction must be in (0, 1], got {fraction}")
+    dev = torch.device(device) if device is not None else None
+    if dev is None or dev.type != "cuda":
+        return False
+    torch.cuda.set_per_process_memory_fraction(fraction, dev.index or 0)
+    return True
+
+
 def _ensure_utf8() -> None:
     """Ensure stdout/stderr use UTF-8 encoding."""
     if hasattr(sys.stdout, 'reconfigure'):

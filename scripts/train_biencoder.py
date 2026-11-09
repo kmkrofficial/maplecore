@@ -29,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from maplecore.indexer import query_prefix_for
 from maplecore.listwise import listwise_kl_loss
-from maplecore.utils import resolve_device
+from maplecore.utils import limit_gpu_memory, resolve_device
 from scripts.oracle_common import load_oracle_samples
 from scripts.targets import block_target
 
@@ -83,6 +83,7 @@ def distill_biencoder(
     temperature: float = 1.0,
     cache_folder: Optional[str] = None,
     cross_negatives: bool = False,
+    max_gpu_mem_frac: Optional[float] = None,
 ) -> dict:
     """Fine-tune ``base_model`` on teacher-attention targets and save it to ``output_dir``."""
     from sentence_transformers import SentenceTransformer
@@ -91,6 +92,9 @@ def distill_biencoder(
     np.random.seed(seed)
     torch.manual_seed(seed)
     device = resolve_device(device)
+    limit_gpu_memory(max_gpu_mem_frac, device)
+    if str(device).startswith("cuda"):
+        torch.cuda.reset_peak_memory_stats()
 
     groups = []  # (query text, [block texts], target tensor)
     for oracle in train_oracles:
@@ -131,7 +135,8 @@ def distill_biencoder(
             opt.step()
             losses.append(loss.item())
         epoch_loss.append(float(np.mean(losses)))
-        logger.info(f"Epoch {epoch}/{epochs} | listwise KL {epoch_loss[-1]:.4f}")
+        peak = torch.cuda.max_memory_reserved() / 2**30 if str(device).startswith("cuda") else 0.0
+        logger.info(f"Epoch {epoch}/{epochs} | listwise KL {epoch_loss[-1]:.4f} | peak GPU reserved {peak:.2f} GiB")
 
     model.eval()
     output_dir = Path(output_dir)
@@ -139,7 +144,10 @@ def distill_biencoder(
     model.save(str(output_dir))
     return {"base_model": base_model, "output_dir": str(output_dir).replace("\\", "/"), "epochs": epochs,
             "loss": epoch_loss, "groups": len(groups), "target_source": target_source, "tau": tau, "lr": lr,
-            "seed": seed, "batch_questions": batch_questions, "cross_negatives": cross_negatives}
+            "seed": seed, "batch_questions": batch_questions, "cross_negatives": cross_negatives,
+            "max_gpu_mem_frac": max_gpu_mem_frac,
+            "peak_gpu_reserved_gib": (torch.cuda.max_memory_reserved() / 2**30
+                                      if str(device).startswith("cuda") else 0.0)}
 
 
 def main(argv: Optional[List[str]] = None) -> dict:
@@ -158,11 +166,13 @@ def main(argv: Optional[List[str]] = None) -> dict:
     p.add_argument("--device", default=None)
     p.add_argument("--cross-negatives", action="store_true",
                    help="also score the other questions' blocks in each batch as zero-target negatives")
+    p.add_argument("--max-gpu-mem-frac", type=float, default=None,
+                   help="cap the CUDA allocator (e.g. 0.75) so Windows never pages VRAM into shared memory")
     a = p.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
     out = distill_biencoder(a.base_model, a.train_oracles, a.output, a.target_source, a.epochs, a.lr,
                             a.batch_questions, a.tau, a.seed, a.max_samples, a.device, a.temperature,
-                            cross_negatives=a.cross_negatives)
+                            cross_negatives=a.cross_negatives, max_gpu_mem_frac=a.max_gpu_mem_frac)
     print(f"saved {out['output_dir']} (final loss {out['loss'][-1]:.4f})")
     return out
 
