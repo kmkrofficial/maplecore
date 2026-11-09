@@ -112,7 +112,9 @@ def run_one(ranker, pool_sizes: Sequence[int], device: str, n_queries: int = 100
         q_embs = [encode_query(q) if encode_query else None for q in questions[:2]]
         q0 = q_embs[0] if q_embs[0] is not None else embs[0]
 
-        t0 = time.perf_counter()  # feasibility probe doubles as warm-up
+        ranker.rank(questions[0], texts, q0, embs, k=k)  # untimed warm-up: lazy model loading, CUDA kernels
+        _sync(device)
+        t0 = time.perf_counter()  # feasibility probe
         ranker.rank(questions[0], texts, q0, embs, k=k)
         _sync(device)
         if time.perf_counter() - t0 > max_seconds_per_query:

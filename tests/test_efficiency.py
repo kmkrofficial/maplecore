@@ -41,3 +41,23 @@ def test_pareto_frontier():
 def test_pareto_frontier_ties_and_single_point():
     assert eff.pareto_frontier({"only": (1.0, 0.1)}) == ["only"]
     assert eff.pareto_frontier({"a": (1.0, 0.5), "b": (1.0, 0.5)}) == ["a", "b"]
+
+
+class LazyLoadRanker:
+    """First call pays a one-off load cost (like a lazily loaded cross-encoder); later calls are fast."""
+    name = "lazy"
+
+    def __init__(self, load_seconds: float):
+        self.load_seconds, self.calls = load_seconds, 0
+
+    def rank(self, question, texts, q_emb=None, block_embs=None, k=None, sample=None):
+        import time
+        self.calls += 1
+        if self.calls == 1:
+            time.sleep(self.load_seconds)
+        return list(range(min(k or len(texts), len(texts))))
+
+
+def test_one_off_load_cost_does_not_make_a_fast_ranker_infeasible():
+    out = eff.run_one(LazyLoadRanker(0.3), pool_sizes=[10], device="cpu", n_queries=3, max_seconds_per_query=0.1)
+    assert out["10"] != "infeasible" and out["10"]["rank_ms"]["p50"] < 100
