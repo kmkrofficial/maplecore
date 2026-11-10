@@ -3,11 +3,58 @@
 **Memory-Aware Predictive Loading Engine** — an experiment in *learned* context
 selection for long-document LLM question answering.
 
-> **Status: research experiment (v0.3.0), negative result.** Predicting a teacher
-> LLM's attention with a cheap student does **not** select context better than
-> plain dense retrieval (see [Results](#results)). Numbers from earlier versions
+> **Status: research experiment, v0.3.0 — negative result.** MAPLE does not
+> select context better than plain dense retrieval. Numbers from earlier versions
 > were affected by bugs and are archived, not claimed (see
 > [docs/METRICS.md §10](docs/METRICS.md#10-numbers-that-must-not-be-reused)).
+
+## Summary: the goal, how it was attempted, and whether it worked
+
+**Goal.** Long-document question answering cannot send a whole document to an LLM,
+so a few pieces have to be selected. The usual way, dense retrieval, picks the
+pieces whose embeddings look most like the question, and misses pieces that matter
+but look different. MAPLE set out to select context **better than dense retrieval
+at almost the same cost**, by learning *where an LLM itself looks* when it answers.
+
+**How.**
+1. A teacher LLM (Llama-3-8B-Instruct, 4-bit) reads a question plus the document in
+   500-character blocks; the attention its final token pays to each block becomes a
+   soft relevance label (5,000 questions from HotpotQA and NarrativeQA: 4,000 for
+   training, 1,000 held out, each labelled at two context budgets).
+2. Cheap students learn to predict those labels: small scorers over frozen
+   BGE-small embeddings (7 variants: residual-on-cosine, listwise KL loss, distractor
+   training, human-label control), and the embedding model itself fine-tuned on the
+   labels (full fine-tune, cross-document negatives, and a regularised version that
+   trains only the top layers and stays close to the base model).
+3. Each student was compared with BM25, dense retrieval, hybrid retrieval and a
+   cross-encoder on held-out sets, long documents, BEIR, multi-hop QA and end-to-end
+   answers from a fixed reader, with pass/fail rules written before each run,
+   3 seeds, significance tests, and published baselines reproduced first.
+
+**Did it work? No.**
+* The idea is half right: the teacher's attention *does* find the evidence better
+  than dense retrieval (HotpotQA 85.9 vs 82.8, NarrativeQA 77.3 vs 71.7
+  evidence recall@5). But using it directly needs the 8B model at query time.
+* No cheap student learned it. The best scorers trained on attention stay below
+  dense retrieval (78.4 vs 82.8); fine-tuning the embedding model gains 1-2.5 points
+  on the training datasets and loses up to 18 points elsewhere (BEIR, multi-hop QA).
+  The regularised version is the best trade-off (+1.1 in-domain, −0.8 on BEIR) and
+  still fails its pre-set bar.
+* End to end, with the same reader, answers built from MAPLE's selection are not
+  significantly different from dense retrieval's (LongBench F1 52.4-53.3 vs 51.5,
+  *p* ≥ 0.17).
+* It is fast (4.55 ms per query over 1M blocks on a GPU), but about 1.5 ms slower
+  than the dense retrieval it fails to beat.
+* Why: the teacher finds a passage such as "Adriana Trigiani… based in Greenwich
+  Village" for "where is the director of *Big Stone Gap* based?" because it has just
+  read the passage that names the director. A student that scores each block on its
+  own cannot make that connection; models that read passages together
+  (cross-encoders, multi-hop retrievers) are where the signal stays usable.
+* The earlier v0.2.0 claims (98% recall, >90% needle, 98% SQuAD) came from bugs and
+  benchmarks too easy to test retrieval; measured properly, that version was the
+  weakest of all (63% vs 82.8% for dense, collapsing to 0.8% on 5,000-block pools).
+
+Full tables are in [Results](#results).
 
 ## Idea
 

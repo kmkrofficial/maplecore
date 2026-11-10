@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ME-R (pre-registered in docs/private/decisions/maple_embed.md, 2026-11-10): top-2 layers + base KL 1.0, 3 seeds,
+# ME-R (pass/fail bars fixed before the run, 2026-11-10): top-2 layers + base KL 1.0, 3 seeds,
 # then held-out (01), multi-hop (09) and BEIR (08). Strictly sequential on the GPU.
 set -u
 cd "$(dirname "$0")/.."
