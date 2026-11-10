@@ -3,9 +3,10 @@
 **Memory-Aware Predictive Loading Engine** — an experiment in *learned* context
 selection for long-document LLM question answering.
 
-> **Status: research experiment (v0.3.0).** There is no
-> paper and no validated result yet. Numbers from earlier versions were affected
-> by bugs and are archived, not claimed (see
+> **Status: research experiment (v0.3.0), negative result.** Predicting a teacher
+> LLM's attention with a cheap student does **not** select context better than
+> plain dense retrieval (see [Results](#results)). Numbers from earlier versions
+> were affected by bugs and are archived, not claimed (see
 > [docs/METRICS.md §10](docs/METRICS.md#10-numbers-that-must-not-be-reused)).
 
 ## Idea
@@ -32,6 +33,70 @@ to** when it answers a question, and uses that to pick context:
 
 The hypothesis under test, and how it is measured, is written down in
 [docs/METRICS.md](docs/METRICS.md).
+
+## Results
+
+Encoder BAAI/bge-small-en-v1.5 for every dense row and every MAPLE student; teacher
+Llama-3-8B-Instruct (4-bit); means over seeds 42/43/44 unless stated; *p* is a
+paired bootstrap against dense retrieval. Protocols in [docs/METRICS.md](docs/METRICS.md).
+
+**Held-out evidence retrieval** (HotpotQA validation 500 questions, ~11 blocks each;
+NarrativeQA test 500, ~11 blocks; teacher budget 1,536 tokens; evidence_recall@5, %):
+
+| method | HotpotQA | NarrativeQA |
+|---|---|---|
+| BM25 | 73.4 | 57.3 |
+| dense retrieval | 82.8 | 71.7 |
+| teacher attention, mean over layers (not a deployable method: needs the 8B model) | 85.9 | 77.3 |
+| MAPLE v1 (original MLP) | 63.1 | 58.4 |
+| best MAPLE scorer trained on teacher attention | 78.4 | 65.1 |
+| MAPLE scorer trained on human evidence labels | 83.7 (*p* 0.17) | 70.1 |
+| MAPLE-Embed, regularised (top 2 encoder layers + KL to the base encoder) | 83.9 (*p* 0.01-0.11) | 71.4 |
+
+**Out of domain** (BEIR SciFact / NFCorpus / FiQA / TREC-COVID, re-ranking BM25's top
+100, macro nDCG@10; multi-hop: 1,000 questions each from MuSiQue / 2Wiki / HotpotQA,
+re-ranking a dense top 20, Recall@5):
+
+| method | BEIR | MuSiQue | 2Wiki | HotpotQA |
+|---|---|---|---|---|
+| BM25 | 44.9 | 49.6 | 68.8 | 80.1 |
+| dense retrieval | **53.9** | 50.6 | **70.8** | 85.9 |
+| hybrid (BM25 + dense, RRF) | 52.0 | **52.4** | 70.7 | **86.6** |
+| MAPLE scorer, human labels (seed 42) | 52.0 | 47.7 | 69.5 | 83.7 |
+| MAPLE-Embed, full fine-tune | 51.6 | 33.2 | 53.5 | 79.5 |
+| MAPLE-Embed, regularised | 53.1 | 49.8 | 70.2 | 86.0 |
+
+On BEIR, our BM25 first stage reproduces published BM25 within 0.2-1.7 points; the
+best published LLM re-ranker in our comparison, ICR with Llama-3.1-8B (Chen et al.,
+ICLR 2025), reports 55.4 on the same four datasets.
+
+**End to end, reader fixed** (Llama-3-8B-Instruct, 2,000-token context, LongBench v1,
+200 questions per task, F1):
+
+| method | HotpotQA | NarrativeQA |
+|---|---|---|
+| whole context (7,500 tokens) | 46.8 | 22.4 |
+| dense retrieval | 51.5 | 17.6 |
+| hybrid | 54.7 | 19.4 |
+| cross-encoder (bge-reranker-base) | 53.5 | 21.4 |
+| MAPLE scorer, human labels | 53.3 | 17.7 |
+| MAPLE-Embed, regularised | 52.4 | 19.4 |
+
+No selection method differs significantly from dense retrieval (*p* ≥ 0.17 for MAPLE).
+Our whole-context row matches the published Llama-3-8B baseline (InfLLM, NeurIPS 2024:
+47.38 / 19.85).
+
+**Speed** (RTX 4090 Laptop; search only, query encoded): the `rerank` strategy takes
+4.55 ms at 1M blocks on the GPU and 4.81 ms at 100k blocks on the CPU, about 1.5 ms
+more than plain cosine similarity; bge-reranker-base needs ~237 ms for 100 candidates.
+
+**What this means.** The teacher's attention is a better relevance signal than
+embedding similarity, but a student that scores each block on its own cannot learn
+it: the teacher finds a passage like "Adriana Trigiani… based in Greenwich Village"
+for "where is the director of *Big Stone Gap* based?" because it has read the
+passage naming the director in the same context. Fine-tuning the encoder gains
+1-2.5 points in-domain and loses as much or more elsewhere, with human labels as
+well. MAPLE is fast, but it does not beat dense retrieval.
 
 ## Install
 

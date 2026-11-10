@@ -76,3 +76,27 @@ If MAPLE still cannot beat dense retrieval after (1)–(3), the publishable
 finding is a careful negative result: a tiny external scorer distilled from
 decoder attention does not outperform a good embedding model, and attention's
 value as a retrieval signal depends on head/layer selection.
+
+## 6. Outcome (v0.3.0, 2026-11-10)
+
+Changes (2) and (3) were implemented and tested; (1) was not, because the existing
+all-layer label already beats dense retrieval and the students were the bottleneck.
+
+| Suggested change | Implemented as | Result |
+|---|---|---|
+| Soft target + listwise KL (Izacard & Grave) | `maplecore/listwise.py`, `scripts/train_v2.py` | +13 HotpotQA over v1, still 4-7 points below dense |
+| Similarity prior (residual on cosine, interaction features) | `MapleResidualNet` | starts at dense; learning the residual from attention moves it *below* dense |
+| Cross-document distractors | `--distractors` | fixes the large-pool collapse (2.4 → 77.6 at 1,000 blocks) |
+| Fine-tuning the encoder itself (Izacard & Grave-style distilled retriever) | `scripts/train_biencoder.py` (MAPLE-Embed) | +2.5 in-domain, −2 BEIR, up to −18 multi-hop; the same with human labels |
+| Regularised fine-tuning (top layers only, KL to the base encoder) | `--train-last-layers`, `--base-kl` | +1.1 in-domain, −0.8 BEIR, −0.4 multi-hop |
+| Stronger baselines (cross-encoder, hybrid, published ICR/RankGPT/InfLLM) | `benchmarks/rankers.py`, benchmarks 08-11 | dense retrieval is within 1.5 nDCG@10 of ICR on BEIR; no MAPLE variant beats it |
+
+This is the negative result anticipated above: a cheap student distilled from
+decoder attention does not outperform a good embedding model. The likely reason is
+structural rather than a matter of labels or training: the teacher's attention to a
+block depends on the other blocks it reads in the same context (it follows multi-hop
+bridges), while a student scores each block on its own. Work that keeps that joint
+view — conditioned multi-hop retrieval (Xiong et al., ICLR 2021), cross-encoder
+re-rankers, or attention used directly (ICR, QRHead) — is where the signal remains
+usable; predicting attention for KV-cache selection inside the model (Quest,
+SeerAttention) uses it where it is the exact target.
