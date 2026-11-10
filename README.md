@@ -56,6 +56,20 @@ at almost the same cost**, by learning *where an LLM itself looks* when it answe
 
 Full tables are in [Results](#results).
 
+## What's next
+
+This version did not solve the problem, but the problem is still worth solving:
+picking the right context from a long document, better than embedding similarity,
+at a cost that stays close to it. We are going to try again with something fresh
+and new, built from what this round taught us (above all, that the useful signal
+comes from reading passages *together*, not one at a time).
+
+It might solve the problem, it might not, or it might only make things somewhat
+better. We don't know yet. Whatever happens, it will be measured the same way as
+this version: rules fixed before the runs, published baselines reproduced first, and
+results reported as they are. Everything in this release stays as the reference
+point.
+
 ## Idea
 
 Instead of sending a whole document to an LLM, or retrieving blocks by
