@@ -138,6 +138,27 @@ exercised.
 Compare at the **same context budget**: full context (where it fits),
 BM25-top-k, dense-top-k, MAPLE-top-k.
 
+## 8b. Published-protocol benchmarks (08-11)
+
+These follow a paper's protocol so our numbers can be placed next to published
+ones. Each reproduces a published *baseline* first; if that check fails the
+run is flagged and no comparison with the paper is made.
+
+| Benchmark | Protocol | Metric | Sanity check (must pass to compare) |
+|---|---|---|---|
+| 08 BEIR re-rank | SciFact, NFCorpus, FiQA, TREC-COVID test queries; BM25 (bm25s, English stop-words) retrieves the top 100 from the full corpus; each method re-orders those 100 | nDCG@10 | our first-stage BM25 within ±2.0 of the published BM25 per dataset (ICR, ICLR 2025, Table 1) |
+| 09 multi-hop re-rank | 1,000 seeded questions each from HippoRAG's released MuSiQue / 2Wiki / HotpotQA sets; corpus = union of their paragraphs; first stage takes the top 20; methods re-order the 20 | Recall@2, Recall@5, All-Recall@5 | first-stage Recall@5 within ±3.0 of ColBERTv2 in ICR Table 2 (a dense first stage never passes) |
+| 10 reader-fixed QA | LongBench HotpotQA / NarrativeQA and NarrativeQA full stories; one fixed reader (Llama-3-8B-Instruct, greedy) gets each method's top blocks up to a 2,000-token budget, restored to document order | F1 (LongBench); ROUGE-L, BLEU-1/4, METEOR (NarrativeQA) | full-context (middle-truncated to 7,500 tokens, as LongBench does for 8k-context models) F1 within ±3.0 of InfLLM's "Original" Llama-3-8B row |
+| 11 efficiency | every method on pools of 20-100k real 500-character blocks, GPU and CPU | p50 / p95 ms (query encoding + ranking), queries/s, peak VRAM/RAM | none (machine-specific; report the hardware) |
+
+BM25 used as a *re-ranker* is fitted on the whole corpus (`BM25Ranker.fit`),
+not on the candidate list: IDF computed over a top-k list is nearly flat,
+because every candidate matches the query.
+
+**Latency targets for the `rerank` strategy** (search only, query already
+encoded, real embeddings): ≤ 20 ms p50 at 1M blocks on a GPU, ≤ 50 ms p50 at
+100k blocks on a CPU.
+
 ## 9. What to report (minimum table set)
 
 1. Q1 table: evidence_recall@5 of oracle_last / oracle_all_layers vs dense / BM25 (both datasets).

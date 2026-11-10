@@ -11,18 +11,24 @@ selection for long-document LLM question answering.
 ## Idea
 
 Instead of sending a whole document to an LLM, or retrieving blocks by
-embedding similarity, MAPLE trains a tiny MLP (`MapleNet`, ~100K parameters)
-to predict **which blocks a teacher LLM would attend to** when answering a
-question:
+embedding similarity alone, MAPLE learns **which blocks a teacher LLM attends
+to** when it answers a question, and uses that to pick context:
 
 1. **Oracle labels.** A teacher (Llama-3-8B-Instruct, 4-bit) reads a question
-   plus 500-character blocks. The final token's attention is summed per block;
-   the top-5 blocks become positive labels.
-2. **Training.** `MapleNet` scores `[query_embedding ‖ block_embedding]`
-   (BGE-small, 384 + 384 dims) and is trained with BCE on those labels.
-3. **Search.** Blocks are scored linearly, or hierarchically: mean-pooled
-   "chapters" of 100 blocks are scored first, then blocks inside the best
-   chapters. An adaptive mode widens the search when confidence is low.
+   plus 500-character blocks. The final token's attention is summed per block
+   (last layer, and the mean over all layers), giving a soft relevance
+   distribution over the blocks.
+2. **Students.** Two ways of learning that distribution:
+   * a small scorer over frozen BGE-small embeddings (`MapleResidualNet`: starts
+     exactly at cosine similarity and learns a residual), trained with a
+     listwise KL loss over each question's blocks, optionally with distractor
+     blocks from other documents;
+   * **MAPLE-Embed**: the sentence encoder itself fine-tuned so that its
+     cosine ranking matches the teacher (optionally only the top layers, with a
+     KL term that keeps it close to the base encoder).
+3. **Search.** `rerank` (default): one matrix-vector product keeps the 200 most
+   similar blocks, then the scorer orders only those. `linear` scores every
+   block; `hierarchical` / `adaptive` score mean-pooled "chapters" first.
 
 The hypothesis under test, and how it is measured, is written down in
 [docs/METRICS.md](docs/METRICS.md).
@@ -78,19 +84,27 @@ result = scanner.search(indexer.encode_query("..."), index, k=5, strategy="adapt
 python scripts/download_data.py
 python scripts/download_data.py --only teacher
 
-# 2. Oracle labels (GPU)
-python scripts/generate_oracle.py        --split train      --max-samples 2000
-python scripts/generate_oracle.py        --split test       --max-samples 500
-python scripts/generate_oracle_hotpot.py --split train      --max-samples 2000
-python scripts/generate_oracle_hotpot.py --split validation --max-samples 500
+# 2. Oracle labels (GPU, ~2 h for both teacher budgets)
+bash scripts/run_oracle_all.sh
 
-# 3. Train
-python scripts/train_generalist.py --seed 42
+# 3. Students
+bash scripts/run_gate.sh gate_a              # scorer variants, 3 seeds x 2 budgets, + evaluation
+bash scripts/run_embed.sh                    # MAPLE-Embed (full fine-tune), 3 seeds
+bash scripts/run_embed_r.sh                  # MAPLE-Embed, top-2 layers + KL to the base encoder
 
-# 4. Evaluate
-python -m benchmarks.run_all                 # 01-05, 07
-python benchmarks/06_e2e_generation.py       # needs GEMINI_API_KEY in .env
+# 4. Evaluate (results in benchmarks/results/, every run logged under runs/)
+python benchmarks/01_recall_enhanced.py --embedding-model <encoder>      # held-out evidence retrieval
+python benchmarks/08_beir_rerank.py --rankers bm25 dense hybrid cross_encoder maple:main --model main=<ckpt>
+python benchmarks/09_multihop_rerank.py --rankers bm25 dense hybrid maple:main --model main=<ckpt>
+python benchmarks/02_latency_scaling.py --devices cuda cpu --model <ckpt>
+python benchmarks/11_efficiency.py --rankers bm25 dense hybrid cross_encoder maple:main --model main=<ckpt>
+python benchmarks/10_e2e_longbench.py --rankers bm25 dense maple:main --model main=<ckpt>   # reader-fixed QA
 ```
+
+On Windows, GPU jobs should run one at a time: a process that outgrows the
+GPU's memory is paged into system RAM and slows down many times instead of
+failing. `scripts/train_biencoder.py --max-gpu-mem-frac 0.8` caps the
+allocator; `scripts/gpu_mem_sampler.ps1` logs dedicated vs shared GPU memory.
 
 ## Repository layout
 
