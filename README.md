@@ -3,7 +3,7 @@
 **Memory-Aware Predictive Loading Engine** — an experiment in *learned* context
 selection for long-document LLM question answering.
 
-> **Status: research experiment (v0.2.0-beta → v0.3 in progress).** There is no
+> **Status: research experiment (v0.3.0).** There is no
 > paper and no validated result yet. Numbers from earlier versions were affected
 > by bugs and are archived, not claimed (see
 > [docs/METRICS.md §10](docs/METRICS.md#10-numbers-that-must-not-be-reused)).

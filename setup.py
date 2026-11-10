@@ -9,7 +9,7 @@ with open("README.md", "r", encoding="utf-8") as f:
 
 setup(
     name="maplecore",
-    version="0.2.0-beta",
+    version="0.3.0",
     author="Keerthi Raajan K M",
     description="Experimental learned context selection for long-document LLM QA",
     long_description=long_description,
