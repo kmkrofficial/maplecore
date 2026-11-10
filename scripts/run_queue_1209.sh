@@ -5,6 +5,10 @@
 set -u
 cd "$(dirname "$0")/.."
 PY="${PYTHON:-.venv/Scripts/python.exe}"; [ -x "$PY" ] || PY=python
+# Repo-local Hugging Face caches (on D:), offline: the user cache on C: is nearly full
+export HF_HUB_CACHE="${HF_HUB_CACHE:-$PWD/.cache/huggingface/hub}"
+export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-$PWD/.cache/huggingface/datasets}"
+export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 PYTHONIOENCODING=utf-8
 R=benchmarks/results
 until grep -q "V2 EVAL DONE" logs/embed_v2_eval.log; do sleep 30; done
 echo "[queue] gold-control train start $(date +%T)"
