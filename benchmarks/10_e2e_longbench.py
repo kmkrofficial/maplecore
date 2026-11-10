@@ -168,11 +168,14 @@ class Reader:
             s += b
             enc = self.tok([texts[i] for i in idx], return_tensors="pt", padding=True, add_special_tokens=False)
             enc = {k: v.to(self.model.device) for k, v in enc.items()}
-            # Memory-efficient (or flash) attention only: with a padding mask PyTorch may otherwise pick the
-            # "math" kernel, which materialises heads x L x L scores (~3.6 GB per layer at 7.5k tokens, plus an
-            # fp32 softmax copy) and, on Windows, pages the overflow into shared system memory. Without an
-            # efficient kernel this raises instead of silently slowing down.
-            with torch.no_grad(), sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION, SDPBackend.FLASH_ATTENTION]):
+            # Fused attention kernels only: with a padding mask PyTorch may otherwise pick the "math" kernel,
+            # which materialises heads x L x L scores (~3.6 GB per layer at 7.5k tokens, plus an fp32 softmax
+            # copy) and, on Windows, pages the overflow into shared system memory. Llama-3's grouped-query
+            # attention arrives as enable_gqa=True, which (torch 2.11) only cuDNN fuses together with a mask:
+            # 167 MB extra at 7.5k tokens, equal to math within fp16 on every non-padded row. Without a fused
+            # kernel this raises instead of silently slowing down.
+            with torch.no_grad(), sdpa_kernel([SDPBackend.CUDNN_ATTENTION, SDPBackend.EFFICIENT_ATTENTION,
+                                               SDPBackend.FLASH_ATTENTION]):
                 gen = self.model.generate(**enc, max_new_tokens=max_new_tokens, do_sample=False,
                                           eos_token_id=self.eos, pad_token_id=self.tok.eos_token_id)
             for j, i in enumerate(idx):

@@ -70,11 +70,12 @@ class _KernelRecordingModel:
     device = "cpu"
 
     def __init__(self):
-        self.math_enabled = []
+        self.math_enabled, self.cudnn_enabled = [], []
 
     def generate(self, input_ids, attention_mask, max_new_tokens, **kw):
         import torch
         self.math_enabled.append(torch.backends.cuda.math_sdp_enabled())
+        self.cudnn_enabled.append(torch.backends.cuda.cudnn_sdp_enabled())
         return torch.cat([input_ids, torch.zeros(input_ids.shape[0], max_new_tokens, dtype=torch.long)], dim=1)
 
 
@@ -85,4 +86,6 @@ def test_reader_generates_without_the_quadratic_math_attention_kernel():
     out = reader.generate(["a long prompt " * 50, "short"], max_new_tokens=3)
     assert out == ["answer", "answer"]
     assert reader.model.math_enabled and not any(reader.model.math_enabled)
+    # Llama-3 uses grouped-query attention (enable_gqa=True): with a mask only cuDNN fuses that (torch 2.11)
+    assert all(reader.model.cudnn_enabled)
     assert torch.backends.cuda.math_sdp_enabled()  # restored afterwards
