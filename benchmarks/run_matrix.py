@@ -30,7 +30,7 @@ except ImportError:
 
 import importlib
 
-from scripts.train_maple import run as run_train
+from scripts.train_generalist import run as run_train
 recall_module = importlib.import_module("benchmarks.01_recall_enhanced")
 run_recall = recall_module.run
 
@@ -60,7 +60,7 @@ def run_matrix():
             config={
                 "embedding_model": embed_model,
                 "epochs": 20,
-                "batch_size": 32,
+                "batch_size": 64,
             },
             reinit=True
         )
@@ -69,18 +69,17 @@ def run_matrix():
         
         try:
             # 1. Train MAPLE for this specific embedding model
-            run_train(
+            train_summary = run_train(
                 epochs=20,
-                batch_size=32,
                 embedding_model=embed_model,
-                output_model_path=output_model
+                output_model_path=output_model,
             )
+            wandb.log({"train/best_val_recall@5": train_summary["best_val_recall@5"]})
             
             # 2. Run Recall Evaluation
             output_data = run_recall(
-                max_samples=200,
+                model_path=output_model,
                 embedding_model=embed_model,
-                model_path=output_model
             )
             
             if not output_data:
@@ -89,9 +88,11 @@ def run_matrix():
                 
             # 3. Log to W&B
             log_dict = {}
-            for ds_name, ds_stats in output_data.items():
-                for method, k_vals in ds_stats["metrics"]["recall@5"].items():
-                    log_dict[f"{ds_name}/recall@5/{method}"] = k_vals
+            for ds_name, ds_stats in output_data["datasets"].items():
+                for method, metrics in ds_stats["summary"].items():
+                    for metric in ("oracle_recall@5", "evidence_recall@5", "answer_in@5"):
+                        if metrics.get(metric) and metrics[metric]["n"]:
+                            log_dict[f"{ds_name}/{metric}/{method}"] = metrics[metric]["mean"]
             
             wandb.log(log_dict)
             

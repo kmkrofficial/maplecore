@@ -110,3 +110,18 @@ models/
 research_log.md
 wandb/
 results/
+# Run logs
+logs/
+
+# Keep dependency files despite *.txt above
+!requirements*.txt
+
+# Local-only notes and scratch work (never committed)
+docs/private/
+scratch/
+
+# Plan-execution workspace (superpowers)
+.superpowers/
+
+# Run registry output (logs, metrics, per-item outputs)
+runs/

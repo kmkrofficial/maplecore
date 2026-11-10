@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import Optional, Union
 
 from .core import MapleNet
 from .indexer import Block, Index, MapleIndexer
@@ -26,7 +26,7 @@ class Maple:
     context retrieval using Memory-Aware Predictive Loading.
     
     Example:
-        >>> client = Maple(model_path="maple.pth")
+        >>> client = Maple(model_path="models/maple_generalist.pth")
         >>> client.index_file("document.txt")
         >>> results = client.query("What is the main topic?")
         >>> for block_id in results.block_ids[:5]:
@@ -39,7 +39,7 @@ class Maple:
         model_path: Optional[Union[str, Path]] = None,
         device: Optional[str] = None,
         chunk_size: int = 500,
-        strategy: str = "adaptive"
+        strategy: str = "rerank"
     ) -> None:
         """
         Initialize MAPLE client.
@@ -49,7 +49,7 @@ class Maple:
             model_path: Path to MAPLE model weights (.pth)
             device: Compute device ('cuda', 'cpu', or None for auto)
             chunk_size: Default chunk size for indexing
-            strategy: Default search strategy ('linear', 'hierarchical', 'adaptive')
+            strategy: Default search strategy ('rerank', 'linear', 'hierarchical', 'adaptive')
         """
         self.device = device or str(get_device())
         self.chunk_size = chunk_size

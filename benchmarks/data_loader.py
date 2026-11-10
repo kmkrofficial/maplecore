@@ -171,7 +171,7 @@ def get_hotpot_qa(
 
     logger.info(f"Loading HotpotQA distractor (split={split})")
     dataset = load_dataset(
-        "hotpot_qa",
+        "hotpotqa/hotpot_qa",
         "distractor",
         split=split
     )

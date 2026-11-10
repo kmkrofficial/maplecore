@@ -1,394 +1,244 @@
 #!/usr/bin/env python3
 """
-Train Generalist MAPLE Model
-============================
+Train a MAPLE model (canonical training script)
+===============================================
 
-Trains a single Sticky-LLM adapter on mixed data from:
-1. NarrativeQA (Literary/Book domain)
-2. HotpotQA (Encyclopedic/Wikipedia domain)
+Trains MapleNet on oracle attention labels from one or more domains:
 
-Goal: Prevent catastrophic forgetting and overfitting to one structure.
+  * NarrativeQA   (``data/oracle/narrativeqa_train.json``)
+  * HotpotQA      (``data/oracle/hotpotqa_train.json``)
+  * optional synthetic "needle" samples (``--needle-samples``)
+
+For every oracle sample, *every* in-context block becomes one training row
+(label 1 for the oracle top-5, 0 otherwise) with its real block id, so the
+validation Recall@5 ranks the full candidate set of each question.
+
+The synthetic needle data uses TRAIN_NEEDLE_TEMPLATES only; the needle
+benchmark (benchmarks/03_needle_robust.py) uses disjoint held-out templates.
+
+Usage:
+    python scripts/train_generalist.py
+    python scripts/train_generalist.py --datasets narrativeqa --needle-samples 0
+    python scripts/train_generalist.py --embedding-model sentence-transformers/all-MiniLM-L6-v2
 """
 
+from __future__ import annotations
+
 import argparse
-import gc
 import json
 import logging
 import random
 import sys
 import uuid
-import requests
-from tqdm import tqdm
 from pathlib import Path
+from typing import Dict, List, Optional, Sequence
 
-import matplotlib.pyplot as plt
 import torch
 
-# Add project root
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from benchmarks.config import DATA_DIR
 from maplecore import MapleIndexer, MapleTrainer
-from maplecore.trainer import Dataset
+from scripts.oracle_common import load_oracle_samples
+from scripts.runlog import current_run, write_model_card
 
-# Setup logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
 logger = logging.getLogger(__name__)
 
-# Constants
-NARRATIVE_DATA = DATA_DIR / "oracle_data.json"
-HOTPOT_DATA = DATA_DIR / "oracle_hotpotqa.json"
-MODEL_OUTPUT = "models/maple_generalist.pth"
+ORACLE_DIR = Path("data/oracle")
+DATASET_FILES = {
+    "narrativeqa": ORACLE_DIR / "narrativeqa_train.json",
+    "hotpotqa": ORACLE_DIR / "hotpotqa_train.json",
+}
+DEFAULT_OUTPUT = Path("models/maple_generalist.pth")
+HAYSTACK_FILE = Path("data/gutenberg/84.txt")  # Frankenstein (benchmark uses Alice, #11)
 
-# Config for Needle
-FRANKENSTEIN_URL = "https://www.gutenberg.org/files/84/84-0.txt"
-CHUNK_SIZE = 200
-NUM_NEEDLE_SAMPLES = 1000
+# Training-only needle templates: (needle sentence, question). The needle
+# benchmark uses a disjoint set (see benchmarks/03_needle_robust.py).
+TRAIN_NEEDLE_TEMPLATES = [
+    ("The secret passkey is {v}.", "What is the secret passkey?"),
+    ("The vault combination is {v}.", "What is the vault combination?"),
+    ("Remember: the access token for the server is {v}.", "What is the access token for the server?"),
+    ("The shipment tracking number is {v}.", "What is the shipment tracking number?"),
+    ("Note that the laboratory door code is {v}.", "What is the laboratory door code?"),
+]
 
-def get_frankenstein_text() -> str:
-    """Download or load Frankenstein text."""
-    path = DATA_DIR / "frankenstein.txt"
-    if not path.exists():
-        logger.info("Downloading Frankenstein from Gutenberg...")
-        try:
-            resp = requests.get(FRANKENSTEIN_URL)
-            resp.raise_for_status()
-            text = resp.text
-            start = text.find("*** START OF THE PROJECT GUTENBERG EBOOK")
-            end = text.find("*** END OF THE PROJECT GUTENBERG EBOOK")
-            if start != -1 and end != -1:
-                text = text[start:end]
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(text)
-        except Exception as e:
-            logger.error(f"Failed to download: {e}")
-            return "Alice " * 10000 
-            
-    with open(path, "r", encoding="utf-8") as f:
-        return f.read()
 
-def generate_needle_data(indexer: MapleIndexer) -> list:
-    """Generate synthetic training data formatted for MapleTrainer."""
-    text = get_frankenstein_text()
-    blocks = indexer.chunk_text(text, chunk_size=CHUNK_SIZE)
-    logger.info("Encoding blocks for mining...")
-    blocks = blocks[:2000]
-    block_embs = indexer.encode_blocks(blocks, show_progress=True)
-    
-    dataset_items = []
-    
-    logger.info(f"Generating {NUM_NEEDLE_SAMPLES} synthetic samples...")
-    for _ in tqdm(range(NUM_NEEDLE_SAMPLES)):
-        secret = str(uuid.uuid4())
-        needle_text = f"The secret passkey is {secret}."
-        query = "What is the secret passkey?"
-        
-        query_emb = indexer.encode_query(query)
-        
-        target_idx = random.randint(0, len(blocks)-1)
-        base_block = blocks[target_idx]
-        
-        style = random.choice(["append", "prepend", "alone", "padded"])
+def build_oracle_rows(samples: List[dict], indexer: MapleIndexer) -> List[Dict]:
+    """One row per (question, in-context block), with real block ids."""
+    rows: List[Dict] = []
+    for n, s in enumerate(samples):
+        blocks = s["blocks"]
+        if not blocks:
+            continue
+        positives = set(s["top_5_block_ids"])
+        q_emb = indexer.encode_query(s["question"]).cpu()
+        b_embs = indexer.encode_texts([b["text"] for b in blocks]).cpu()
+        group = f"{s['domain']}::{s['id']}"
+        for b, emb in zip(blocks, b_embs):
+            rows.append({
+                "group": group,
+                "question": s["question"],
+                "query_emb": q_emb,
+                "block_emb": emb,
+                "label": 1.0 if b["id"] in positives else 0.0,
+                "block_id": int(b["id"]),
+                "domain": s["domain"],
+            })
+        if (n + 1) % 100 == 0:
+            logger.info(f"  encoded {n + 1}/{len(samples)} samples")
+    return rows
+
+
+def build_needle_rows(indexer: MapleIndexer, num_samples: int, seed: int = 0,
+                      negatives_per_sample: int = 9) -> List[Dict]:
+    """Synthetic needle rows: one positive + hard/easy negatives per sample."""
+    if num_samples <= 0:
+        return []
+    from benchmarks.data_loader import get_gutenberg_books
+
+    rng = random.Random(seed)
+    text = get_gutenberg_books([84]).get(84) or ("It was a dark and stormy night. " * 4000)
+    blocks = indexer.chunk_text(text, chunk_size=500)[:2000]
+    block_embs = indexer.encode_blocks(blocks, show_progress=False).cpu()
+
+    rows: List[Dict] = []
+    for i in range(num_samples):
+        template, question = rng.choice(TRAIN_NEEDLE_TEMPLATES)
+        value = str(uuid.UUID(int=rng.getrandbits(128)))
+        needle = template.format(v=value)
+        target = rng.randrange(len(blocks))
+        base = blocks[target].text
+        style = rng.choice(["append", "prepend", "middle", "alone"])
         if style == "append":
-            injected_text = base_block.text + f" {needle_text}"
+            injected = f"{base} {needle}"
         elif style == "prepend":
-            injected_text = f"{needle_text} " + base_block.text
-        elif style == "padded":
-            injected_text = f"\n\n{needle_text}\n\n"
+            injected = f"{needle} {base}"
+        elif style == "middle":
+            cut = len(base) // 2
+            injected = f"{base[:cut]} {needle} {base[cut:]}"
         else:
-            injected_text = needle_text
-            
-        target_emb = indexer.model.encode(injected_text, convert_to_tensor=True)
-        
-        # Positive
-        dataset_items.append({
-            "question": query,
-            "query_emb": query_emb,
-            "block_emb": target_emb,
-            "label": 1.0,
-            "block_id": base_block.id if hasattr(base_block, "id") else -1,
-            "domain": "synthetic_needle"
-        })
-        
-        # Hard Negative 1 (wrong needle)
-        wrong_secret = str(uuid.uuid4())
-        wrong_text = base_block.text + f" The secret passkey is {wrong_secret}."
-        wrong_emb = indexer.model.encode(wrong_text, convert_to_tensor=True)
-        
-        dataset_items.append({
-            "question": query,
-            "query_emb": query_emb,
-            "block_emb": wrong_emb,
-            "label": 0.0,
-            "block_id": -1,
-            "domain": "synthetic_needle"
-        })
-        
-        # Hard Negative 2 (same block, no needle)
-        dataset_items.append({
-            "question": query,
-            "query_emb": query_emb,
-            "block_emb": block_embs[target_idx],
-            "label": 0.0,
-            "block_id": -1,
-            "domain": "synthetic_needle"
-        })
-        
-        # Hard Negative 3 (adjacent block prior)
-        if target_idx > 0:
-            dataset_items.append({
-                "question": query,
-                "query_emb": query_emb,
-                "block_emb": block_embs[target_idx - 1],
-                "label": 0.0,
-                "block_id": -1,
-                "domain": "synthetic_needle"
-            })
-            
-        # Hard Negative 4 (adjacent block after)
-        if target_idx < len(block_embs) - 1:
-            dataset_items.append({
-                "question": query,
-                "query_emb": query_emb,
-                "block_emb": block_embs[target_idx + 1],
-                "label": 0.0,
-                "block_id": -1,
-                "domain": "synthetic_needle"
-            })
-        
-        # Hard Negative 5 and 6 (random blocks)
-        for _ in range(2):
-            neg_idx = random.randint(0, len(blocks)-1)
-            if abs(neg_idx - target_idx) > 10:
-                dataset_items.append({
-                    "question": query,
-                    "query_emb": query_emb,
-                    "block_emb": block_embs[neg_idx],
-                    "label": 0.0,
-                    "block_id": -1,
-                    "domain": "synthetic_needle"
-                })
-                
-    return dataset_items
+            injected = needle
 
-def load_and_merge_data():
-    """Load both datasets and merge them."""
-    data = []
-    
-    # 1. NarrativeQA
-    if NARRATIVE_DATA.exists():
-        with open(NARRATIVE_DATA, "r", encoding="utf-8") as f:
-            nq_data = json.load(f)
-            # Handle list vs dict format
-            if isinstance(nq_data, dict) and "samples" in nq_data:
-                nq_data = nq_data["samples"]
-            
-            logger.info(f"Loaded {len(nq_data)} NarrativeQA samples.")
-            for item in nq_data:
-                item["domain"] = "narrative_qa" # Ensure tag
-            data.extend(nq_data)
-    else:
-        logger.warning(f"{NARRATIVE_DATA} not found! Training only on HotpotQA?")
+        wrong = f"{base} " + rng.choice(TRAIN_NEEDLE_TEMPLATES)[0].format(v=str(uuid.uuid4()))
+        q_emb = indexer.encode_query(question).cpu()
+        pos_emb, wrong_emb = indexer.encode_texts([injected, wrong]).cpu()
 
-    # 2. HotpotQA
-    if HOTPOT_DATA.exists():
-        with open(HOTPOT_DATA, "r", encoding="utf-8") as f:
-            hq_data = json.load(f)
-            logger.info(f"Loaded {len(hq_data)} HotpotQA samples.")
-            # ...
-            for item in hq_data:
-                item["domain"] = "hotpot_qa" # Ensure tag
-            data.extend(hq_data)
-    else:
-        logger.warning(f"{HOTPOT_DATA} not found!")
-        
-    if not data:
-        raise ValueError("No training data found!")
-        
-    # Shuffle to mix domains in batches
-    random.shuffle(data)
-    logger.info(f"Total training samples: {len(data)}")
-    
-    return data
+        group = f"needle::{i}"
+        cand = [(pos_emb, 1.0, 0), (wrong_emb, 0.0, 1), (block_embs[target], 0.0, 2)]
+        neg_ids = rng.sample(range(len(blocks)), k=min(negatives_per_sample - 2, len(blocks)))
+        cand += [(block_embs[j], 0.0, 3 + n) for n, j in enumerate(neg_ids) if j != target]
+        for emb, label, bid in cand:
+            rows.append({"group": group, "question": question, "query_emb": q_emb,
+                         "block_emb": emb, "label": label, "block_id": bid,
+                         "domain": "synthetic_needle"})
+    logger.info(f"Built {len(rows)} needle rows from {num_samples} samples")
+    return rows
 
-def prepare_dataset(raw_samples, indexer: MapleIndexer) -> Dataset:
-    """Convert raw oracle samples to Trainer Dataset."""
-    dataset_items = []
-    
-    # Pre-embed logic (conceptually similar to train_maple.py)
-    # But since MapleTrainer expects (query_emb, pos_embs, neg_embs),
-    # we can just prepare those lists.
-    # Wait, MapleTrainer.train() takes a list of (query, pos, neg) tuples?
-    # No, let's check MapleTrainer signature.
-    # It takes a DataLoader or list.
-    
-    # We'll use the same logic as train_maple.py:
-    # 1. Embed query
-    # 2. Embed "pos" (top-5 blocks)
-    # 3. Embed "neg" (random other blocks)
-    
-    logger.info("Encoding samples for training...")
-    
-    for sample in raw_samples:
-        query_text = sample["question"]
-        
-        # Normalize schema
-        if "top_5_block_ids" in sample: 
-            # NarrativeQA Schema
-            label_ids = set(sample["top_5_block_ids"])
-            # Convert all_block_texts dict to list of {id, text}
-            blocks = []
-            for bid_str, text in sample["all_block_texts"].items():
-                blocks.append({"id": int(bid_str), "text": text})
-        else:
-            # HotpotQA Schema (default)
-            blocks = sample["blocks"] # List of {id, text}
-            label_ids = set(sample["labels"])
-        
-        # 1. Embed Query
-        query_emb = indexer.encode_query(query_text) # (dim,)
-        
-        # 2. Embed Blocks (Batch)
-        # Note: blocks might not be sorted by ID, but that's fine for sets
-        block_texts = [b["text"] for b in blocks]
-        if not block_texts: continue
-        
-        block_embs = indexer.model.encode(block_texts, convert_to_tensor=True)
-        
-        # 3. Split Positive/Negative
-        pos_embs = []
-        neg_embs = []
-        
-        for i, block in enumerate(blocks):
-            if block["id"] in label_ids:
-                pos_embs.append(block_embs[i])
-            else:
-                neg_embs.append(block_embs[i])
-                
-        # 4. Create Triples/Pairs
-        # Simplest approach: One entry per Positive, with 1 Negative
-        if not pos_embs: continue
-        if not neg_embs: continue # Rare case
-        
-        # Balance: If we have 5 pos, pick 5 negs
-        num_pairs = min(len(pos_embs), len(neg_embs))
-        # Or use all positives and random negatives
-        
-        for i in range(len(pos_embs)):
-            p_emb = pos_embs[i]
-            # Pick a random negative
-            n_emb = random.choice(neg_embs)
-            
-            # Positive
-            dataset_items.append({
-                "question": query_text,
-                "query_emb": query_emb,
-                "block_emb": p_emb,
-                "label": 1.0,
-                "block_id": blocks[i]["id"], # Use normalized block ID
-                "domain": sample.get("domain", "unknown")
-            })
-            # Negative
-            dataset_items.append({
-                "question": query_text,
-                "query_emb": query_emb,
-                "block_emb": n_emb,
-                "label": 0.0,
-                "block_id": -1, # Dummy ID for negative
-                "domain": sample.get("domain", "unknown")
-            })
-            
-    logger.info(f"Created {len(dataset_items)} training pairs.")
-    return dataset_items
+
+def run(
+    datasets: Sequence[str] = ("narrativeqa", "hotpotqa"),
+    needle_samples: int = 1000,
+    epochs: int = 20,
+    batch_size: int = 64,
+    lr: float = 1e-3,
+    embedding_model: str = "BAAI/bge-small-en-v1.5",
+    output_model_path: Path = DEFAULT_OUTPUT,
+    device: Optional[str] = None,
+    seed: int = 42,
+    max_samples_per_dataset: Optional[int] = None,
+    oracle_dir: Path = ORACLE_DIR,
+) -> dict:
+    """Train and save a MAPLE model. Returns a summary dict."""
+    random.seed(seed)
+    torch.manual_seed(seed)
+    indexer = MapleIndexer(model_name=embedding_model, device=device)
+
+    rows: List[Dict] = []
+    used = {}
+    for name in datasets:
+        path = Path(oracle_dir) / DATASET_FILES[name].name
+        if not path.exists():
+            raise FileNotFoundError(f"{path} missing. Generate it first (see docs/DATA.md).")
+        samples = load_oracle_samples(path)
+        if max_samples_per_dataset:
+            samples = samples[:max_samples_per_dataset]
+        logger.info(f"{name}: {len(samples)} oracle samples")
+        rows.extend(build_oracle_rows(samples, indexer))
+        used[name] = len(samples)
+
+    rows.extend(build_needle_rows(indexer, needle_samples, seed=seed))
+    used["synthetic_needle"] = needle_samples
+    pos = sum(r["label"] for r in rows)
+    logger.info(f"Total rows: {len(rows)} ({int(pos)} positive)")
+
+    trainer = MapleTrainer(
+        input_dim=indexer.get_embedding_dimension() * 2,
+        hidden_dim=128,
+        device=device,
+        seed=seed,
+    )
+    model, best_recall = trainer.train(
+        training_data=rows, epochs=epochs, batch_size=batch_size, lr=lr,
+        val_split=0.2, save_path=str(output_model_path),
+    )
+
+    summary = {
+        "output_model": str(output_model_path),
+        "embedding_model": embedding_model,
+        "datasets": used,
+        "oracle_dir": str(oracle_dir),
+        "rows": len(rows),
+        "positives": int(pos),
+        "epochs": epochs,
+        "batch_size": batch_size,
+        "lr": lr,
+        "seed": seed,
+        "best_val_recall@5": best_recall,
+        "history": trainer.history_,
+    }
+    cur = current_run()
+    if cur is not None:  # keep per-epoch metrics, the checkpoint and a model card in the run registry
+        cur.config["data_files"] = [str(Path(oracle_dir) / DATASET_FILES[n].name) for n in datasets]
+        for epoch, (loss, rec) in enumerate(zip(trainer.history_["loss"], trainer.history_["val_recall"]), 1):
+            cur.log_metrics({"train_loss": loss, "val_recall@5": rec}, step=epoch)
+        cur.log_metrics({"best_val_recall@5": best_recall})
+        cur.add_artifact(Path(output_model_path), "checkpoint")
+        write_model_card(Path(output_model_path), cur, {"best_val_recall@5": best_recall})
+    summary_path = Path(output_model_path).with_suffix(".train.json")
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+    logger.info(f"Training summary -> {summary_path}")
+    return summary
+
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--epochs", type=int, default=3)
-    parser.add_argument("--device", type=str, default="cuda")
-    args = parser.parse_args()
-    
-    # 1. Load merged data
-    raw_data = load_and_merge_data()
-    
-    # 2. Initialize Indexer (for embeddings)
-    indexer = MapleIndexer(device=args.device) # Loads BGE
-    
-    # 3. Prepare Tensors
-    train_data = prepare_dataset(raw_data, indexer)
-    
-    # Run garbage collection after preparing the first dataset
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    
-    # Generate needle data
-    needle_data = generate_needle_data(indexer)
-    train_data.extend(needle_data)
-    
-    # Shuffle entire dataset
-    random.shuffle(train_data)
-    
-    # Run garbage collection before training
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    
-    # 4. Train
-    logger.info("Starting training...")
-    input_dim = indexer.get_embedding_dimension() * 2
-    trainer = MapleTrainer(
-        input_dim=input_dim,
-        hidden_dim=128,
-        device=args.device
-    )
-    
-    model_path = Path(MODEL_OUTPUT)
-    model_path.parent.mkdir(parents=True, exist_ok=True)
+    p = argparse.ArgumentParser(description="Train MAPLE (canonical)")
+    p.add_argument("--datasets", nargs="+", default=["narrativeqa", "hotpotqa"], choices=list(DATASET_FILES))
+    p.add_argument("--needle-samples", type=int, default=1000)
+    p.add_argument("--epochs", type=int, default=20)
+    p.add_argument("--batch-size", type=int, default=64)
+    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--embedding-model", default="BAAI/bge-small-en-v1.5")
+    p.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    p.add_argument("--device", default=None)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--max-samples-per-dataset", type=int, default=None)
+    p.add_argument("--oracle-dir", type=Path, default=ORACLE_DIR,
+                   help="Folder with {narrativeqa,hotpotqa}_train.json (e.g. data/oracle/t4096)")
+    a = p.parse_args()
 
-    trainer.train(
-        training_data=train_data,
-        epochs=args.epochs,
-        batch_size=32,
-        lr=1e-3,
-        val_split=0.2,
-        save_path=str(model_path)
-    )
-    
-    logger.info(f"Model saved to {model_path}")
-    
-    # 6. Plot Training Curve
-    if hasattr(trainer, "history_"):
-        plt.figure(figsize=(10, 5))
-        plt.subplot(1, 2, 1)
-        plt.plot(trainer.history_["loss"], label="Train Loss")
-        plt.title("Loss")
-        plt.legend()
-        
-        plt.subplot(1, 2, 2)
-        plt.plot(trainer.history_["val_recall"], label="Val Recall")
-        plt.title("Recall")
-        plt.legend()
-        
-        plt.tight_layout()
-        plt.savefig("benchmarks/results/training_generalist_curve.png")
-        logger.info("Training curve saved.")
+    from benchmarks.profiler import HardwareMonitor, wrap_result
+    with HardwareMonitor(interval=0.5) as mon:
+        summary = run(a.datasets, a.needle_samples, a.epochs, a.batch_size, a.lr,
+                      a.embedding_model, a.output, a.device, a.seed, a.max_samples_per_dataset,
+                      a.oracle_dir)
+    out = Path(a.output).with_suffix(".hardware.json")
+    with open(out, "w", encoding="utf-8") as f:
+        json.dump(wrap_result({"best_val_recall@5": summary["best_val_recall@5"]}, mon), f, indent=2)
+    print(f"Best val Recall@5: {summary['best_val_recall@5'] * 100:.1f}%  ->  {a.output}")
+
 
 if __name__ == "__main__":
-    from benchmarks.profiler import HardwareMonitor, wrap_result
-    import json
-    
-    with HardwareMonitor(interval=0.1) as mon:
+    from scripts.runlog import start_run
+    with start_run("train", "generalist", {"argv": sys.argv[1:]}):
         main()
-
-        
-    # Save metrics (Only hardware for now as main() returns nothing)
-    metrics = {"status": "completed"}
-    final_output = wrap_result(metrics, mon)
-    
-    out_path = Path("models/training_metrics.json")
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(final_output, f, indent=2)
-        
-    print(f"Training profile saved to {out_path}")

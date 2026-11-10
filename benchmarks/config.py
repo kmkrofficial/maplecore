@@ -16,13 +16,13 @@ RESULTS_DIR = BENCHMARK_DIR / "results"
 
 # Ensure directories exist at import time
 DATA_DIR.mkdir(exist_ok=True)
-RESULTS_DIR.mkdir(exist_ok=True)
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 # ---------------------------------------------------------------------------
 # Model & Device
 # ---------------------------------------------------------------------------
 DEFAULT_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-MODEL_PATH = Path("models/maple_generalist.pth")
+MODEL_PATH = BENCHMARK_DIR.parent / "models" / "maple_generalist.pth"
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -41,11 +41,17 @@ NEEDLE_DEPTHS = [0.0, 0.25, 0.5, 0.75, 1.0]
 NEEDLE_CONTEXT_SIZES = [5_000, 10_000, 25_000]
 
 # ---------------------------------------------------------------------------
-# LLM Pricing ($ per 1M input tokens)
+# LLM Pricing — ILLUSTRATIVE ONLY. Edit to current list prices before quoting
+# any dollar figure. The cost benchmark's primary output is token reduction,
+# which does not depend on these numbers.
+# ($ per 1M input tokens)
 # ---------------------------------------------------------------------------
-LLM_PRICING = {
-    "gpt-4o": 5.00,
+PRICING = {
+    "example-large-model": {"input": 2.50},
+    "example-small-model": {"input": 0.15},
 }
+LLM_PRICING = {k: v["input"] for k, v in PRICING.items()}  # backwards compatibility
+COST_NUM_QUERIES = 100
 
 # ---------------------------------------------------------------------------
 # Embedding Model

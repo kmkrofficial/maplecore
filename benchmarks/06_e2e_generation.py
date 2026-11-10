@@ -3,9 +3,18 @@
 Benchmark 06: E2E Generation Matrix
 ===================================
 Tests MAPLE retrieved context against actual LLM generation accuracy.
-Evaluates Gemini API models and local 4-bit Llama-3.
+Evaluates Gemini API models and (optionally) a local 4-bit Llama-3.
 
-Tracks metrics on a Weights & Biases dashboard.
+Retrieval stress: a SQuAD context is ~2 blocks and a
+HotpotQA context ~10, so "top-5" used to hand the LLM (almost) everything.
+Each sample's context is now padded with other samples' contexts up to
+``--haystack-chars`` (default 50,000 ~ 100 blocks), with the true context at a
+random position. ``--haystack-chars 0`` reproduces the old setting.
+
+Metrics per model: LLM-judge accuracy, exact match, token F1, retrieval
+answer-containment (is the gold answer in the retrieved chunks?), latency, hops.
+
+Requires GEMINI_API_KEY (and optionally WANDB_API_KEY) in .env.
 """
 
 import os
@@ -35,9 +44,16 @@ try:
 except ImportError:
     genai = None
 
+import random
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 from datasets import load_dataset
 from maplecore import MapleIndexer, MapleNet, MapleScanner
 from benchmarks.config import MODEL_PATH
+from benchmarks import metrics as M
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -85,7 +101,7 @@ Respond with EXACTLY and ONLY the word "YES" if the answer is correct, or "NO" i
 
 def load_and_prepare_dataset(dataset_name: str, num_samples: int = 50):
     if dataset_name == "squad":
-        ds = load_dataset('squad', split='validation')
+        ds = load_dataset('rajpurkar/squad', split='validation')
         samples = []
         for i, item in enumerate(ds):
             if i >= num_samples: break
@@ -96,7 +112,7 @@ def load_and_prepare_dataset(dataset_name: str, num_samples: int = 50):
             })
         return samples
     elif dataset_name == "hotpot_qa":
-        ds = load_dataset('hotpot_qa', 'distractor', split='validation')
+        ds = load_dataset('hotpotqa/hotpot_qa', 'distractor', split='validation')
         samples = []
         for i, item in enumerate(ds):
             if i >= num_samples: break
@@ -110,20 +126,36 @@ def load_and_prepare_dataset(dataset_name: str, num_samples: int = 50):
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
 
-def retrieve_contexts(dataset_name: str, num_samples: int = 50) -> List[Dict]:
-    """Prepares sample caches for the orchestrator."""
-    logger.info(f"Loading {num_samples} {dataset_name} questions...")
-    raw_samples = load_and_prepare_dataset(dataset_name, num_samples)
-    
+def retrieve_contexts(dataset_name: str, num_samples: int = 50, haystack_chars: int = 50_000,
+                      seed: int = 0) -> List[Dict]:
+    """Prepare samples; pad each context with other samples' contexts."""
+    logger.info(f"Loading {num_samples} {dataset_name} questions (haystack={haystack_chars:,} chars)...")
+    # SQuAD has ~5 questions per paragraph, so load extra rows to get enough unique contexts
+    per_ctx = 20 if dataset_name == "squad" else 1
+    pool_n = num_samples + (max(1, haystack_chars // 600) * per_ctx if haystack_chars else 0)
+    raw_samples = load_and_prepare_dataset(dataset_name, pool_n)
+    rng = random.Random(seed)
+    contexts = list(dict.fromkeys(s["context"] for s in raw_samples))
+
     eval_cache = []
-    
-    for i, s in enumerate(raw_samples):
+    for s in raw_samples[:num_samples]:
+        context = s["context"]
+        if haystack_chars and len(context) < haystack_chars:
+            others = [c for c in contexts if c != context]
+            rng.shuffle(others)
+            filler, size = [], len(context)
+            for c in others:
+                if size >= haystack_chars:
+                    break
+                filler.append(c)
+                size += len(c) + 2
+            pos = rng.randint(0, len(filler))
+            context = "\n\n".join(filler[:pos] + [context] + filler[pos:])
         eval_cache.append({
             "question": s["question"],
-            "raw_context": s["context"],
+            "raw_context": context,
             "ground_truths": s["ground_truths"]
         })
-        
     return eval_cache
 
 def _process_gemini_sample(item: Dict, model, orchestrator, delay: float, agentic_search: bool = False) -> dict:
@@ -152,6 +184,7 @@ def _process_gemini_sample(item: Dict, model, orchestrator, delay: float, agenti
             llm_generator=llm_generator,
             top_k=5
         )
+        retrieved_has_answer = None
     else:
         # Standard Single-Pass Retrieval (The Librarian)
         res = orchestrator.scanner.search(orchestrator.indexer.encode_query(item["question"]), index, strategy="adaptive")
@@ -161,6 +194,7 @@ def _process_gemini_sample(item: Dict, model, orchestrator, delay: float, agenti
         prompt = f"Context:\n{context_str}\n\nQuestion: {item['question']}\n\nAnswer the question concisely using the context. If the context does not fully contain the answer, output 'Insufficient context'."
         prediction = llm_generator(prompt)
         hop_count = 0
+        retrieved_has_answer = M.answer_in_context(context_str, item["ground_truths"])
         
     latency = time.time() - start_time
     
@@ -175,6 +209,9 @@ def _process_gemini_sample(item: Dict, model, orchestrator, delay: float, agenti
         "prediction": prediction,
         "ground_truths": item["ground_truths"],
         "accuracy": score,
+        "exact_match": M.exact_match(prediction, item["ground_truths"]),
+        "f1": M.token_f1(prediction, item["ground_truths"]),
+        "retrieved_has_answer": retrieved_has_answer,
         "latency_sec": latency,
         "hop_count": hop_count
     }
@@ -204,11 +241,19 @@ def evaluate_gemini_model(eval_cache: List[Dict], model_name: str, dataset_name:
     avg_latency = np.mean([r["latency_sec"] for r in results])
     avg_hops = np.mean([r["hop_count"] for r in results])
     
-    logger.info(f"  {model_name} - Accuracy: {avg_accuracy:.1f}%, Latency: {avg_latency:.2f}s, Hops: {avg_hops:.1f}")
+    em = np.mean([r["exact_match"] for r in results]) * 100
+    f1 = np.mean([r["f1"] for r in results]) * 100
+    ctx = [r["retrieved_has_answer"] for r in results if r["retrieved_has_answer"] is not None]
+    ctx_rate = float(np.mean(ctx) * 100) if ctx else float("nan")
+    logger.info(f"  {model_name} - Judge: {avg_accuracy:.1f}%, EM: {em:.1f}%, F1: {f1:.1f}%, "
+                f"answer-in-context: {ctx_rate:.1f}%, Latency: {avg_latency:.2f}s, Hops: {avg_hops:.1f}")
     
     if run:
         wandb.log({
             f"{dataset_name}/{model_name}/accuracy": avg_accuracy,
+            f"{dataset_name}/{model_name}/exact_match": em,
+            f"{dataset_name}/{model_name}/f1": f1,
+            f"{dataset_name}/{model_name}/answer_in_context": ctx_rate,
             f"{dataset_name}/{model_name}/latency_sec": avg_latency,
             f"{dataset_name}/{model_name}/hop_count": avg_hops
         })
@@ -216,8 +261,12 @@ def evaluate_gemini_model(eval_cache: List[Dict], model_name: str, dataset_name:
     return {
         "model": model_name,
         "metrics": {
-            "accuracy": avg_accuracy,
-            "latency_sec": avg_latency
+            "judge_accuracy": avg_accuracy,
+            "exact_match": em,
+            "f1": f1,
+            "answer_in_context": ctx_rate,
+            "latency_sec": avg_latency,
+            "hops": avg_hops,
         },
         "samples": results
     }
@@ -302,6 +351,7 @@ def evaluate_llama_local(eval_cache: List[Dict], dataset_name: str, orchestrator
                 llm_generator=llm_generator,
                 top_k=5
             )
+            retrieved_has_answer = None
         else:
             # Standard Single-Pass Retrieval (The Librarian)
             query_emb = orchestrator.indexer.encode_query(item["question"])
@@ -312,6 +362,7 @@ def evaluate_llama_local(eval_cache: List[Dict], dataset_name: str, orchestrator
             prompt = f"Context:\n{context_str}\n\nQuestion: {item['question']}\n\nAnswer the question concisely using the context. If the context does not fully contain the answer, output 'Insufficient context'."
             prediction = llm_generator(prompt)
             hop_count = 0
+            retrieved_has_answer = M.answer_in_context(context_str, item["ground_truths"])
             
         latency = time.time() - start_time
         
@@ -323,6 +374,9 @@ def evaluate_llama_local(eval_cache: List[Dict], dataset_name: str, orchestrator
             "prediction": prediction,
             "ground_truths": item["ground_truths"],
             "accuracy": score,
+            "exact_match": M.exact_match(prediction, item["ground_truths"]),
+            "f1": M.token_f1(prediction, item["ground_truths"]),
+            "retrieved_has_answer": retrieved_has_answer,
             "latency_sec": latency,
             "hop_count": hop_count
         })
@@ -364,7 +418,15 @@ def evaluate_llama_local(eval_cache: List[Dict], dataset_name: str, orchestrator
 def main():
     parser = argparse.ArgumentParser(description="Run MAPLE E2E Benchmarks")
     parser.add_argument("--enable-agentic-search", action="store_true", help="Enable experimental multi-hop Recursive Orchestrator")
+    parser.add_argument("--num-samples", type=int, default=50)
+    parser.add_argument("--haystack-chars", type=int, default=50_000,
+                        help="Pad each context to this many chars with other samples' contexts (0 = original setting)")
+    parser.add_argument("--gemini-models", nargs="+", default=None)
+    parser.add_argument("--with-llama", action="store_true", help="Also evaluate local 4-bit Llama-3-8B")
+    parser.add_argument("--model", type=str, default=str(MODEL_PATH))
     args = parser.parse_args()
+    if args.gemini_models:
+        GEMINI_MODELS[:] = args.gemini_models
 
     print("="*60)
     print("Benchmark 06: E2E Generation Metrics")
@@ -381,7 +443,8 @@ def main():
             name=f"e2e_{timestamp}", 
             group="e2e_evaluation",
             tags=["generation"] + TARGET_DATASETS,
-            config={"agentic_search": args.enable_agentic_search}
+            config={"agentic_search": args.enable_agentic_search, "haystack_chars": args.haystack_chars,
+                    "num_samples": args.num_samples, "gemini_models": GEMINI_MODELS}
         )
         
     all_reports = {}
@@ -390,7 +453,7 @@ def main():
     
     logger.info("Initializing MAPLE Pipeline & Orchestrator...")
     indexer = MapleIndexer(device=DEVICE)
-    bge_weights = "models/maple_bge_small_en_v1.5.pth"
+    bge_weights = args.model
     if not os.path.exists(bge_weights):
         logger.error(f"MAPLE Net not found at {bge_weights}")
         return
@@ -401,7 +464,8 @@ def main():
 
     for dataset_name in TARGET_DATASETS:
         print(f"\n--- Evaluating Dataset: {dataset_name} ---")
-        eval_cache = retrieve_contexts(dataset_name=dataset_name, num_samples=50)
+        eval_cache = retrieve_contexts(dataset_name=dataset_name, num_samples=args.num_samples,
+                                       haystack_chars=args.haystack_chars)
         if not eval_cache:
             logger.error(f"Failed to construct evaluation caching for {dataset_name}. Skipping.")
             continue
@@ -413,7 +477,8 @@ def main():
         dataset_reports.extend(gemini_reports)
         
         # Run Llama sequentially
-        llama_report = evaluate_llama_local(eval_cache, dataset_name, orchestrator, run, args.enable_agentic_search)
+        llama_report = (evaluate_llama_local(eval_cache, dataset_name, orchestrator, run, args.enable_agentic_search)
+                        if args.with_llama else {})
         if llama_report:
             dataset_reports.append(llama_report)
             
@@ -433,8 +498,8 @@ def main():
         run.finish()
         
     # JSON Dump
-    os.makedirs("results", exist_ok=True)
-    report_path = f"results/e2e_metrics_{timestamp}.json"
+    os.makedirs("benchmarks/results", exist_ok=True)
+    report_path = f"benchmarks/results/e2e_metrics_{timestamp}.json"
     with open(report_path, "w", encoding="utf-8") as f:
         json.dump(all_reports, f, indent=4)
         
@@ -442,4 +507,6 @@ def main():
     print("\nBENCHMARK 06 COMPLETE")
 
 if __name__ == "__main__":
-    main()
+    from scripts.runlog import start_run
+    with start_run("bench", "06_e2e", {"argv": sys.argv[1:]}):
+        main()

@@ -1,247 +1,250 @@
 #!/usr/bin/env python3
 """
-Generate Oracle Data (HotpotQA)
-===============================
+MAPLE Oracle Generator — HotpotQA (distractor)
+==============================================
+Same teacher, prompt and attention aggregation as ``generate_oracle.py``
+(see ``scripts/oracle_common.py``), applied to HotpotQA. The 10 paragraphs
+(2 gold + 8 distractors) are flattened into one document and chunked into
+500-char blocks.
 
-Generates ground-truth attention labels for HotpotQA using Llama-3-8B-Instruct.
-This script complements `generate_oracle.py` (NarrativeQA) to create a diverse
-multi-domain training set.
+Because HotpotQA annotates supporting *sentences*, each sample also stores
+``gold_block_ids`` — the blocks overlapping a supporting sentence — which lets
+us measure how well the attention oracle agrees with human evidence.
 
-Method:
-1. Load HotpotQA (distractor) dataset via HuggingFace.
-2. Flatten the list of paragraphs into a single context string.
-3. Feed to Llama-3 (4-bit).
-4. Extract attention weights from the last layer.
-5. Identify top-5 "heavy hitter" blocks.
-6. Save to `data/oracle_hotpotqa.json`.
+Usage:
+    python scripts/generate_oracle_hotpot.py --split train --max-samples 500
+    python scripts/generate_oracle_hotpot.py --split validation --max-samples 200
 """
+
+from __future__ import annotations
 
 import argparse
 import json
 import logging
 import sys
+import time
+from collections import Counter
 from pathlib import Path
 
-import torch
-from datasets import load_dataset
-from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
-# Add project root to path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from benchmarks.config import DATA_DIR
-from maplecore.indexer import MapleIndexer
+from maplecore.indexer import Block, MapleIndexer
+from scripts.oracle_common import (
+    DEFAULT_TEACHER,
+    HeadStore,
+    OracleScorer,
+    calibration_prompt,
+    build_prompt_with_mapping,
+    load_teacher,
+    make_metadata,
+    overlapping_block_ids,
+    save_json,
+)
 
-# Setup logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
 logger = logging.getLogger(__name__)
 
-# Constants
-MODEL_ID = "meta-llama/Meta-Llama-3-8B-Instruct"
-MAX_CONTEXT_TOKENS = 1024  # Reduced from 1536 to save VRAM
-OUTPUT_FILE = DATA_DIR / "oracle_hotpotqa.json"
-CHECKPOINT_FILE = DATA_DIR / "oracle_hotpot_checkpoint.json"
+CHUNK_SIZE = 500
+TOP_K = 5
+CHECKPOINT_EVERY = 25
+OUT_DIR = Path("data/oracle")
 
-def get_hotpot_samples(split="train", max_samples=None):
-    """Load and format HotpotQA samples."""
-    logger.info(f"Loading HotpotQA ({split})...")
-    dataset = load_dataset("hotpot_qa", "distractor", split=split, trust_remote_code=True)
-    
-    samples = []
-    count = 0
-    
+
+def flatten_hotpot(item: dict):
+    """
+    Flatten HotpotQA context into one string.
+
+    Returns:
+        text, list of (start, end) char spans of supporting sentences,
+        list of (start, end) char spans of supporting paragraphs
+    """
+    support = {}
+    for title, sent_id in zip(item["supporting_facts"]["title"], item["supporting_facts"]["sent_id"]):
+        support.setdefault(title, set()).add(sent_id)
+
+    parts, pos = [], 0
+    sent_spans, para_spans = [], []
+    for title, sentences in zip(item["context"]["title"], item["context"]["sentences"]):
+        header = f"Title: {title}\n"
+        para_start = pos
+        parts.append(header)
+        pos += len(header)
+        for j, sent in enumerate(sentences):
+            piece = sent if j == 0 else " " + sent
+            if title in support and j in support[title]:
+                lead = 0 if j == 0 else 1
+                sent_spans.append((pos + lead, pos + len(piece)))
+            parts.append(piece)
+            pos += len(piece)
+        if title in support:
+            para_spans.append((para_start, pos))
+        parts.append("\n\n")
+        pos += 2
+    return "".join(parts), sent_spans, para_spans
+
+
+def run(split: str = "train", max_samples: int = 500, max_tokens: int = 1536,
+        teacher: str = DEFAULT_TEACHER, resume: bool = False, output: Path | None = None,
+        attn_impl: str = "fast", batch_size: int = 8, save_heads: bool = False,
+        calibration_query: str | None = None) -> Path:
+    from datasets import load_dataset
+
+    if save_heads and attn_impl != "fast":
+        raise ValueError("--save-heads requires --attn-impl fast")
+
+    output = output or OUT_DIR / f"hotpotqa_{split}.json"
+    print("=" * 70)
+    print("MAPLE Oracle Generator (HotpotQA distractor)")
+    print(f"  Teacher:     {teacher}")
+    print(f"  Split:       {split}")
+    print(f"  Max context: {max_tokens} tokens | chunk {CHUNK_SIZE} chars | top-{TOP_K}")
+    print(f"  Max samples: {max_samples}")
+    print(f"  Attention:   {attn_impl} (batch {batch_size if attn_impl == 'fast' else 1})")
+    print(f"  Output:      {output}")
+    print("=" * 70)
+
+    samples, done = [], set()
+    if resume and output.exists():
+        with open(output, "r", encoding="utf-8") as f:
+            samples = json.load(f)["samples"]
+        done = {s["id"] for s in samples}
+
+    heads = None
+    if save_heads:  # per-head attention mass, kept aligned with the JSON samples (also across --resume)
+        heads = HeadStore(output.with_suffix(".heads.pt"))
+        if samples:
+            heads.load().align_to([s["id"] for s in samples])
+    heads_calib = None
+    if calibration_query:  # ICR-style calibration pass: same blocks, content-free question
+        if any("attention_scores_calib" not in s for s in samples):
+            raise ValueError("cannot resume with --calibration-query: existing samples were generated without it")
+        if save_heads:
+            heads_calib = HeadStore(output.with_suffix(".heads_calib.pt"))
+            if samples:
+                heads_calib.load().align_to([s["id"] for s in samples])
+
+    dataset = load_dataset("hotpotqa/hotpot_qa", "distractor", split=split)
+    model, tokenizer = load_teacher(teacher, attn_impl=attn_impl)
+    scorer = OracleScorer(model, tokenizer, attn_impl, keep_heads=save_heads)
+    if attn_impl == "eager":
+        batch_size = 1
+    chunker = MapleIndexer(device="cpu")
+    skipped = Counter()
+    start_time = time.time()
+    new_count = 0
+    pending = []  # (record without scores, input_ids, block_ranges)
+    last_save = len(samples)
+
+    def save(final: bool = False):
+        meta = make_metadata("hotpotqa_distractor", teacher, max_tokens, CHUNK_SIZE, TOP_K,
+                             len(samples), split, skipped=dict(skipped), complete=final,
+                             attn_impl=attn_impl, batch_size=batch_size, save_heads=save_heads, calibration_query=calibration_query)
+        save_json({"metadata": meta, "samples": samples}, output)
+        if heads is not None:
+            heads.save()
+        if heads_calib is not None:
+            heads_calib.save()
+
+    def flush():
+        nonlocal new_count, last_save
+        if not pending:
+            return
+        results = scorer.score([(ids, ranges) for _, ids, ranges in pending])
+        calib_results = [None] * len(pending)
+        if calibration_query:
+            calib_results = scorer.score([
+                calibration_prompt([Block(b["id"], b["text"]) for b in rec["blocks"]], ranges, calibration_query, tokenizer)
+                for rec, _, ranges in pending])
+        for (rec, ids, ranges), res, cres in zip(pending, results, calib_results):
+            if res is None or (calibration_query and cres is None):
+                skipped["oom"] += 1
+                continue
+            last_scores, all_scores, *extra = res
+            if heads is not None:
+                heads.add(rec["id"], [b["id"] for b in rec["blocks"]], extra[0])
+            if calibration_query:
+                c_last, c_all, *c_extra = cres
+                rec["attention_scores_calib"] = {str(k): round(v, 6) for k, v in c_last.items()}
+                rec["attention_scores_all_layers_calib"] = {str(k): round(v, 6) for k, v in c_all.items()}
+                if heads_calib is not None:
+                    heads_calib.add(rec["id"], [b["id"] for b in rec["blocks"]], c_extra[0])
+            ranked = sorted(last_scores.items(), key=lambda x: x[1], reverse=True)
+            rec["top_5_block_ids"] = [bid for bid, _ in ranked[:TOP_K]]
+            rec["attention_scores"] = {str(k): round(v, 6) for k, v in ranked}
+            rec["attention_scores_all_layers"] = {str(k): round(v, 6) for k, v in all_scores.items()}
+            rec["attn_impl"] = attn_impl
+            samples.append(rec)
+            new_count += 1
+        pending.clear()
+        rate = new_count / max(time.time() - start_time, 1e-6)
+        s = samples[-1]
+        logger.info(f"[{len(samples):>4d}/{max_samples}] blocks={s['num_blocks_in_context']} "
+                    f"top={s['top_5_block_ids']} gold={s['gold_block_ids']} ({rate:.2f}/s)")
+        if len(samples) - last_save >= CHECKPOINT_EVERY:
+            save()
+            last_save = len(samples)
+
     for item in dataset:
-        if max_samples and count >= max_samples:
+        if len(samples) + len(pending) >= max_samples:
             break
-            
-        # HotpotQA structure:
-        # context: {'title': ['t1', 't2'], 'sentences': [['s1', 's2'], ['s3']]}
-        # question: str
-        # answer: str
-        
-        titles = item['context']['title']
-        sentences_list = item['context']['sentences']
-        
-        # Flatten into one document
-        full_text = ""
-        for title, sentences in zip(titles, sentences_list):
-            full_text += f"\n\nTitle: {title}\n"
-            full_text += " ".join(sentences)
-            
-        samples.append({
-            "id": item['id'],
-            "question": item['question'],
-            "text": full_text.strip(),
-            "answer": item['answer']
-        })
-        count += 1
-        
-    logger.info(f"Loaded {len(samples)} samples.")
-    return samples
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--max-samples", type=int, default=50, help="Number of samples to process")
-    args = parser.parse_args()
-    
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    
-    # 1. Load Data
-    samples = get_hotpot_samples("train", args.max_samples)
-    
-    # 2. Load Model (4-bit)
-    logger.info(f"Loading {MODEL_ID} (4-bit)...")
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_use_double_quant=True,
-        bnb_4bit_compute_dtype=torch.float16
-    )
-    
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-    tokenizer.pad_token = tokenizer.eos_token
-    
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_ID,
-        quantization_config=bnb_config,
-        device_map="auto",
-        attn_implementation="eager", # Required for extracting weights
-        torch_dtype=torch.float16,
-    )
-    model.eval()
-    
-    # 3. Process Samples
-    indexer = MapleIndexer()
-    indexer.chunk_size = 500 # Valid if property exists, otherwise it relies on config
-    oracle_data = []
-    
-    # Resume if checkpoint exists
-    if CHECKPOINT_FILE.exists():
-        with open(CHECKPOINT_FILE, "r") as f:
-            oracle_data = json.load(f)
-            logger.info(f"Resumed from checkpoint: {len(oracle_data)} samples.")
-    
-    start_idx = len(oracle_data)
-    
-    logger.info("Generating oracle attention labels...")
-    for i in tqdm(range(start_idx, len(samples))):
-        sample = samples[i]
-        
-        # Chunk text
-        blocks = indexer.chunk_text(sample["text"])
-        if not blocks:
+        if item["id"] in done:
             continue
-            
-        # Build Prompt trace
-        # We need to map tokens back to block IDs
-        prompt_text = ""
-        block_ranges = [] # (block_id, start_char, end_char) relative to prompt
-        
-        # System prompt
-        system_msg = "You are a helpful AI assistant. Answer the user's question based on the context.\n\nContext:\n"
-        prompt_text += system_msg
-        
-        current_pos = len(prompt_text)
-        
-        # Add blocks to prompt
-        valid_blocks = []
-        for block in blocks:
-            # Simple format: [ID] Text
-            block_str = f"[{block.id}] {block.text}\n"
-            
-            # Check token limit roughly (4 chars ~ 1 token)
-            if (len(prompt_text) + len(block_str)) / 4 > MAX_CONTEXT_TOKENS:
-                break
-                
-            prompt_text += block_str
-            end_pos = current_pos + len(block_str)
-            
-            # We track valid blocks that made it into context
-            valid_blocks.append(block)
-            block_ranges.append((block.id, current_pos, end_pos))
-            current_pos = end_pos
-            
-        prompt_text += f"\nQuestion: {sample['question']}\nAnswer:"
-        
-        # Tokenize (fast)
-        inputs = tokenizer(prompt_text, return_tensors="pt").to(model.device)
-        input_ids = inputs.input_ids
-        
-        # Check explicit token length
-        if input_ids.shape[1] > MAX_CONTEXT_TOKENS:
-            input_ids = input_ids[:, :MAX_CONTEXT_TOKENS]
-            
-        # Forward Pass
-        with torch.no_grad():
-            outputs = model(
-                input_ids, 
-                output_attentions=True,
-                use_cache=False
-            )
-            
-        # Extract Attention
-        # Shape: (batch, heads, seq_len, seq_len)
-        # We take the last layer, average across heads
-        last_layer_attn = outputs.attentions[-1][0].mean(dim=0).cpu() # Move to CPU
-        
-        # Cleanup VRAM immediately
-        del outputs
-        torch.cuda.empty_cache()
-        
-        # We care about the attention of the LAST token (the one generating the answer)
-        # towards all previous tokens.
-        last_token_attn = last_layer_attn[-1, :] # (seq_len,)
-        
-        # Map tokens to blocks
-        # We need token offsets. offset_mapping is supported by FastTokenizer
-        token_offsets = tokenizer(prompt_text, return_offsets_mapping=True).offset_mapping
-        # Truncate offsets to match input_ids length
-        token_offsets = token_offsets[:input_ids.shape[1]]
-        
-        block_scores = {b.id: 0.0 for b in valid_blocks}
-        
-        for token_idx, score in enumerate(last_token_attn):
-            start_char, end_char = token_offsets[token_idx]
-            if start_char == end_char: continue # Special token
-            
-            # Find which block this token belongs to
-            # This is O(N_blocks), could be optimized but N is small (10-50)
-            for bid, b_start, b_end in block_ranges:
-                if start_char >= b_start and end_char <= b_end:
-                    block_scores[bid] += score.item()
-                    break
-        
-        # Top-5 Blocks
-        sorted_blocks = sorted(block_scores.items(), key=lambda x: x[1], reverse=True)
-        top_k_ids = [bid for bid, score in sorted_blocks[:5]]
-        
-        # Save Sample
-        # Store block texts for the trainer to re-embed
-        processed_blocks = [{"id": b.id, "text": b.text} for b in valid_blocks]
-        
-        oracle_data.append({
-            "id": sample["id"],
-            "question": sample["question"],
-            "blocks": processed_blocks,
-            "labels": top_k_ids, # Target block IDs
-            "domain": "hotpot_qa"
-        })
-        
-        # Checkpoint
-        if i % 10 == 0:
-            with open(CHECKPOINT_FILE, "w") as f:
-                json.dump(oracle_data, f)
-                
-    # Final Save
-    with open(OUTPUT_FILE, "w") as f:
-        json.dump(oracle_data, f, indent=2)
-        
-    logger.info(f"Saved {len(oracle_data)} samples to {OUTPUT_FILE}")
-    
-    # Cleanup checkpointer
-    if CHECKPOINT_FILE.exists():
-        CHECKPOINT_FILE.unlink()
+
+        text, sent_spans, para_spans = flatten_hotpot(item)
+        blocks = chunker.chunk_text(text, chunk_size=CHUNK_SIZE)
+        input_ids, block_ranges = build_prompt_with_mapping(blocks, item["question"], tokenizer, max_tokens)
+        if len(block_ranges) < TOP_K + 1:
+            skipped["too_few_blocks"] += 1
+            continue
+
+        in_context_ids = {bid for bid, _, _ in block_ranges}
+        in_context = [b for b in blocks if b.id in in_context_ids]
+        pending.append(({
+            "id": item["id"],
+            "domain": "hotpot_qa",
+            "type": item.get("type"),
+            "level": item.get("level"),
+            "question": item["question"],
+            "answers": [item["answer"]],
+            "blocks": [{"id": b.id, "text": b.text} for b in in_context],
+            "gold_block_ids": overlapping_block_ids(in_context, sent_spans),
+            "gold_paragraph_block_ids": overlapping_block_ids(in_context, para_spans),
+            "num_blocks_in_context": len(block_ranges),
+            "num_blocks_total": len(blocks),
+            "seq_len": int(input_ids.shape[1]),
+        }, input_ids, block_ranges))
+        if len(pending) >= batch_size:
+            flush()
+
+    flush()
+    scorer.close()
+    save(final=True)
+    elapsed = time.time() - start_time
+    print(f"\nDone: {new_count} new samples ({len(samples)} total) in {elapsed:.0f}s "
+          f"({new_count / max(elapsed, 1e-6):.2f}/s); skipped={dict(skipped)}")
+    print(f"Output: {output}")
+    return output
+
 
 if __name__ == "__main__":
-    main()
+    p = argparse.ArgumentParser(description="MAPLE Oracle Generator (HotpotQA)")
+    p.add_argument("--split", default="train", choices=["train", "validation"])
+    p.add_argument("--max-samples", type=int, default=500)
+    p.add_argument("--max-tokens", type=int, default=1536)
+    p.add_argument("--teacher", default=DEFAULT_TEACHER)
+    p.add_argument("--output", type=Path, default=None)
+    p.add_argument("--resume", action="store_true")
+    p.add_argument("--attn-impl", choices=["fast", "eager"], default="fast",
+                   help="fast = SDPA + last-row capture, batched; eager = v0.2.0-style reference")
+    p.add_argument("--batch-size", type=int, default=8, help="Prompts per forward pass (fast path)")
+    p.add_argument("--calibration-query", default=None,
+                   help="Also score every prompt with this content-free question (e.g. \"N/A\") for calibration")
+    p.add_argument("--save-heads", action="store_true",
+                   help="Also save per-layer, per-head attention mass per block to <output>.heads.pt (fast path only)")
+    a = p.parse_args()
+    from scripts.runlog import record_outputs, start_run
+    with start_run("oracle", f"hotpot_{a.split}_{a.max_tokens}", vars(a)) as _run:
+        out_path = run(a.split, a.max_samples, a.max_tokens, a.teacher, a.resume, a.output,
+                       a.attn_impl, a.batch_size, a.save_heads, a.calibration_query)
+        record_outputs(_run, out_path, role='oracle')

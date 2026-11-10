@@ -2,15 +2,15 @@
 MAPLE: Memory-Aware Predictive Loading Engine
 ==============================================
 
-A learned retrieval system for infinite-context LLM inference.
-MAPLE achieves 71% Recall@5 compared to 30% for standard RAG
-while maintaining sub-millisecond search latency.
+Experimental learned context selection for long-document LLM QA: a small MLP
+is trained to predict which text blocks a teacher LLM attends to.
+See docs/METRICS.md for how this is evaluated; no results are claimed yet.
 
 Quick Start::
 
     from maplecore import Maple
 
-    client = Maple(model_path="maple.pth")
+    client = Maple(model_path="models/maple_generalist.pth")
     client.index_file("books/sherlock_holmes.txt")
     results = client.query("Who is the killer?")
     context = client.get_context(results, max_blocks=5)
@@ -25,7 +25,7 @@ Classes:
         
     MapleNet
         Lightweight MLP for relevance scoring.
-        Architecture: 768 → 128 → 1 (sigmoid output).
+        Architecture: 2·dim → 128 → 1 (logit; sigmoid at search time).
         
     MapleIndexer
         Chunking + BGE embedding engine.
@@ -61,11 +61,12 @@ Utilities:
 from .client import Maple
 from .core import MapleNet
 from .indexer import Block, Index, MapleIndexer
+from .models import MapleResidualNet, load_model, save_model
 from .search import MapleScanner, SearchResult, SearchStrategy
 from .trainer import MapleTrainer
 from .utils import get_device, setup_logging
 
-__version__ = "0.2.0-beta"
+__version__ = "0.3.0"
 __author__ = "Keerthi Raajan K M"
 
 __all__ = [
@@ -73,6 +74,9 @@ __all__ = [
     "Maple",
     # Model & Search
     "MapleNet",
+    "MapleResidualNet",
+    "load_model",
+    "save_model",
     "MapleScanner",
     "MapleIndexer",
     "MapleTrainer",

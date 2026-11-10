@@ -24,8 +24,7 @@ def main():
     
     # Initialize client
     client = Maple(
-        model_path="maple.pth",
-        device="cuda",
+        model_path="models/maple_generalist.pth",
         strategy="adaptive"
     )
     
