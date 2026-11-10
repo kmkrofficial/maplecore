@@ -44,3 +44,45 @@ def test_chunk_words_splits_story_into_100_word_chunks():
     story = " ".join(f"w{i}" for i in range(250))
     chunks = lb.chunk_words(story, 100)
     assert [len(c.split()) for c in chunks] == [100, 100, 50]
+
+
+class _FakeTok:
+    eos_token_id = 0
+
+    def encode(self, text, add_special_tokens=False):
+        return list(range(len(text.split())))
+
+    def decode(self, ids, skip_special_tokens=True):
+        return "answer"
+
+    def apply_chat_template(self, msgs, add_generation_prompt=True, tokenize=False):
+        return msgs[0]["content"]
+
+    def __call__(self, texts, return_tensors="pt", padding=True, add_special_tokens=False):
+        import torch
+        n = max(len(t.split()) for t in texts)
+        return {"input_ids": torch.ones(len(texts), n, dtype=torch.long),
+                "attention_mask": torch.ones(len(texts), n, dtype=torch.long)}
+
+
+class _KernelRecordingModel:
+    """Stands in for the 8B reader: records which SDPA kernels are allowed while generate() runs."""
+    device = "cpu"
+
+    def __init__(self):
+        self.math_enabled = []
+
+    def generate(self, input_ids, attention_mask, max_new_tokens, **kw):
+        import torch
+        self.math_enabled.append(torch.backends.cuda.math_sdp_enabled())
+        return torch.cat([input_ids, torch.zeros(input_ids.shape[0], max_new_tokens, dtype=torch.long)], dim=1)
+
+
+def test_reader_generates_without_the_quadratic_math_attention_kernel():
+    import torch
+    reader = lb.Reader.__new__(lb.Reader)
+    reader.model, reader.tok, reader.eos = _KernelRecordingModel(), _FakeTok(), [0]
+    out = reader.generate(["a long prompt " * 50, "short"], max_new_tokens=3)
+    assert out == ["answer", "answer"]
+    assert reader.model.math_enabled and not any(reader.model.math_enabled)
+    assert torch.backends.cuda.math_sdp_enabled()  # restored afterwards

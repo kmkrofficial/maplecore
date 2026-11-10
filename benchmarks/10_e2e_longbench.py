@@ -154,6 +154,7 @@ class Reader:
     def generate(self, prompts: Sequence[str], max_new_tokens: int, batch_size: int = 4,
                  max_len: int = LONGBENCH_MAX_TOKENS) -> List[str]:
         import torch
+        from torch.nn.attention import SDPBackend, sdpa_kernel
 
         texts = [self._chat(p, max_len) for p in prompts]
         lens = [len(self.tok.encode(t, add_special_tokens=False)) for t in texts]
@@ -167,7 +168,11 @@ class Reader:
             s += b
             enc = self.tok([texts[i] for i in idx], return_tensors="pt", padding=True, add_special_tokens=False)
             enc = {k: v.to(self.model.device) for k, v in enc.items()}
-            with torch.no_grad():
+            # Memory-efficient (or flash) attention only: with a padding mask PyTorch may otherwise pick the
+            # "math" kernel, which materialises heads x L x L scores (~3.6 GB per layer at 7.5k tokens, plus an
+            # fp32 softmax copy) and, on Windows, pages the overflow into shared system memory. Without an
+            # efficient kernel this raises instead of silently slowing down.
+            with torch.no_grad(), sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION, SDPBackend.FLASH_ATTENTION]):
                 gen = self.model.generate(**enc, max_new_tokens=max_new_tokens, do_sample=False,
                                           eos_token_id=self.eos, pad_token_id=self.tok.eos_token_id)
             for j, i in enumerate(idx):
@@ -280,8 +285,13 @@ if __name__ == "__main__":
     ap.add_argument("--embedding-model", default=BGE_MODEL_NAME)
     ap.add_argument("--batch-size", type=int, default=4)
     ap.add_argument("--device", default=None)
+    ap.add_argument("--max-gpu-mem-frac", type=float, default=0.80,
+                    help="cap the CUDA allocator (OOM instead of paging VRAM into shared memory)")
     a = ap.parse_args()
     paths = {kv.split("=", 1)[0]: Path(kv.split("=", 1)[1]) for kv in a.model}
+    import torch
+    from maplecore.utils import limit_gpu_memory
+    limit_gpu_memory(a.max_gpu_mem_frac, "cuda" if torch.cuda.is_available() else "cpu")
     from scripts.runlog import record_outputs, start_run
     with start_run("bench", "10_e2e", vars(a)) as _run:
         run(a.tasks, a.rankers, a.budget_tokens, a.n_narrativeqa, a.limit, a.seed, paths, a.reader_model,
