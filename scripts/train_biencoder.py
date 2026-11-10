@@ -68,6 +68,29 @@ def listwise_batch(q: torch.Tensor, blocks: torch.Tensor, sizes: Sequence[int], 
     return scores, target, mask
 
 
+def freeze_all_but_last_layers(model, n: int) -> int:
+    """Freeze every parameter of a sentence-transformers BERT-style model except its top ``n`` transformer layers.
+    Returns the number of trainable parameters."""
+    for prm in model.parameters():
+        prm.requires_grad = False
+    layers = model[0].auto_model.encoder.layer
+    if not 0 < n <= len(layers):
+        raise ValueError(f"train_last_layers must be in 1..{len(layers)}, got {n}")
+    for prm in layers[-n:].parameters():
+        prm.requires_grad = True
+    return sum(prm.numel() for prm in model.parameters() if prm.requires_grad)
+
+
+def base_kl_loss(scores: torch.Tensor, base_scores: torch.Tensor, mask: torch.Tensor, tau: float) -> torch.Tensor:
+    """KL(base || student) between per-row softmax(score / tau) distributions over the unmasked entries: keeps the
+    fine-tuned encoder's ranking of each question's candidates close to the frozen base encoder's."""
+    neg = torch.finfo(scores.dtype).min
+    log_p = torch.log_softmax((scores / tau).masked_fill(~mask, neg), dim=-1)
+    log_b = torch.log_softmax((base_scores.to(scores.dtype) / tau).masked_fill(~mask, neg), dim=-1)
+    kl = (log_b.exp() * (log_b - log_p)).masked_fill(~mask, 0.0).sum(-1)
+    return kl.mean()
+
+
 def distill_biencoder(
     base_model: str,
     train_oracles: Sequence[Path],
@@ -84,6 +107,8 @@ def distill_biencoder(
     cache_folder: Optional[str] = None,
     cross_negatives: bool = False,
     max_gpu_mem_frac: Optional[float] = None,
+    train_last_layers: Optional[int] = None,
+    base_kl: float = 0.0,
 ) -> dict:
     """Fine-tune ``base_model`` on teacher-attention targets and save it to ``output_dir``."""
     from sentence_transformers import SentenceTransformer
@@ -110,13 +135,21 @@ def distill_biencoder(
 
     model = SentenceTransformer(base_model, device=device, cache_folder=cache_folder)
     prefix = query_prefix_for(base_model)
-    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+    n_trainable = (freeze_all_but_last_layers(model, train_last_layers) if train_last_layers
+                   else sum(prm.numel() for prm in model.parameters()))
+    base = None
+    if base_kl > 0:
+        base = SentenceTransformer(base_model, device=device, cache_folder=cache_folder).eval()
+        for prm in base.parameters():
+            prm.requires_grad = False
+    opt = torch.optim.AdamW([prm for prm in model.parameters() if prm.requires_grad], lr=lr, weight_decay=0.01)
     rng = np.random.default_rng(seed)
 
-    def embed(texts: List[str]) -> torch.Tensor:
-        feats = model.tokenize(texts)
+    def embed(texts: List[str], m=None) -> torch.Tensor:
+        m = m or model
+        feats = m.tokenize(texts)
         feats = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in feats.items()}  # some entries are strings
-        return model(feats)["sentence_embedding"]
+        return m(feats)["sentence_embedding"]
 
     epoch_loss = []
     model.train()
@@ -130,6 +163,13 @@ def distill_biencoder(
             scores, target, mask = listwise_batch(q, all_blocks, [len(g[1]) for g in chunk],
                                                   [g[2] for g in chunk], cross_negatives)
             loss = listwise_kl_loss(scores, target, mask, tau=tau)
+            if base is not None:
+                with torch.no_grad():
+                    bq = torch.nn.functional.normalize(embed([prefix + g[0] for g in chunk], base), dim=-1)
+                    bb = torch.nn.functional.normalize(embed([t for g in chunk for t in g[1]], base), dim=-1)
+                    base_scores, _, _ = listwise_batch(bq, bb, [len(g[1]) for g in chunk], [g[2] for g in chunk],
+                                                       cross_negatives)
+                loss = loss + base_kl * base_kl_loss(scores, base_scores, mask, tau)
             opt.zero_grad()
             loss.backward()
             opt.step()
@@ -145,7 +185,8 @@ def distill_biencoder(
     return {"base_model": base_model, "output_dir": str(output_dir).replace("\\", "/"), "epochs": epochs,
             "loss": epoch_loss, "groups": len(groups), "target_source": target_source, "tau": tau, "lr": lr,
             "seed": seed, "batch_questions": batch_questions, "cross_negatives": cross_negatives,
-            "max_gpu_mem_frac": max_gpu_mem_frac,
+            "max_gpu_mem_frac": max_gpu_mem_frac, "train_last_layers": train_last_layers, "base_kl": base_kl,
+            "trainable_params": n_trainable,
             "peak_gpu_reserved_gib": (torch.cuda.max_memory_reserved() / 2**30
                                       if str(device).startswith("cuda") else 0.0)}
 
@@ -168,11 +209,16 @@ def main(argv: Optional[List[str]] = None) -> dict:
                    help="also score the other questions' blocks in each batch as zero-target negatives")
     p.add_argument("--max-gpu-mem-frac", type=float, default=None,
                    help="cap the CUDA allocator (e.g. 0.75) so Windows never pages VRAM into shared memory")
+    p.add_argument("--train-last-layers", type=int, default=None,
+                   help="fine-tune only the top N transformer layers (others frozen)")
+    p.add_argument("--base-kl", type=float, default=0.0,
+                   help="weight of a KL term keeping rankings close to the frozen base encoder")
     a = p.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
     out = distill_biencoder(a.base_model, a.train_oracles, a.output, a.target_source, a.epochs, a.lr,
                             a.batch_questions, a.tau, a.seed, a.max_samples, a.device, a.temperature,
-                            cross_negatives=a.cross_negatives, max_gpu_mem_frac=a.max_gpu_mem_frac)
+                            cross_negatives=a.cross_negatives, max_gpu_mem_frac=a.max_gpu_mem_frac,
+                            train_last_layers=a.train_last_layers, base_kl=a.base_kl)
     print(f"saved {out['output_dir']} (final loss {out['loss'][-1]:.4f})")
     return out
 

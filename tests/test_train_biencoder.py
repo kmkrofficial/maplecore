@@ -111,3 +111,41 @@ def test_distill_with_cross_negatives_records_the_setting(tmp_path):
     out = distill_biencoder(BASE, [oracle], tmp_path / "enc", epochs=1, max_samples=8, device="cpu",
                             batch_questions=4, cache_folder=str(REPO_CACHE), cross_negatives=True)
     assert out["cross_negatives"] is True and (tmp_path / "enc").exists()
+
+
+def test_freeze_all_but_last_layers_leaves_only_top_layers_trainable():
+    from sentence_transformers import SentenceTransformer
+    from scripts.train_biencoder import freeze_all_but_last_layers
+
+    model = SentenceTransformer(BASE, device="cpu", cache_folder=str(REPO_CACHE))
+    n = freeze_all_but_last_layers(model, 2)
+    encoder = model[0].auto_model
+    top = sum(p.numel() for p in encoder.encoder.layer[-2:].parameters())
+    assert n == top == sum(p.numel() for p in model.parameters() if p.requires_grad)
+    assert not any(p.requires_grad for p in encoder.embeddings.parameters())
+
+
+def test_base_kl_is_zero_for_identical_scores_and_ignores_padding():
+    from scripts.train_biencoder import base_kl_loss
+
+    scores = torch.tensor([[0.9, 0.1, 0.0], [0.5, 0.4, 0.0]])
+    mask = torch.tensor([[True, True, True], [True, True, False]])
+    assert base_kl_loss(scores, scores.clone(), mask, tau=0.05).item() < 1e-6
+    shifted = scores.clone()
+    shifted[1, 2] = 99.0  # padded position: must not count
+    assert base_kl_loss(scores, shifted, mask, tau=0.05).item() < 1e-6
+    assert base_kl_loss(scores, scores.flip(-1), mask, tau=0.05).item() > 0.1
+
+
+def test_distill_with_frozen_layers_keeps_lower_layers_identical(tmp_path):
+    from sentence_transformers import SentenceTransformer
+    from scripts.train_biencoder import distill_biencoder
+
+    oracle = _write_oracle_texts(tmp_path, 8)
+    out = distill_biencoder(BASE, [oracle], tmp_path / "enc", epochs=1, max_samples=8, device="cpu",
+                            batch_questions=4, cache_folder=str(REPO_CACHE), train_last_layers=2, base_kl=1.0)
+    assert out["train_last_layers"] == 2 and out["base_kl"] == 1.0
+    base = SentenceTransformer(BASE, device="cpu", cache_folder=str(REPO_CACHE))[0].auto_model
+    tuned = SentenceTransformer(str(tmp_path / "enc"), device="cpu")[0].auto_model
+    assert torch.equal(base.encoder.layer[0].attention.self.query.weight, tuned.encoder.layer[0].attention.self.query.weight)
+    assert not torch.equal(base.encoder.layer[-1].output.dense.weight, tuned.encoder.layer[-1].output.dense.weight)
